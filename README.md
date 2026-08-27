@@ -1,100 +1,67 @@
-# Video Renderer Backend 2.5 — Cinematic Layer
+# Slideshow Studio — Render Backend
 
-FFmpeg-based render service for the Novel Recap Video Editor. Version 2.5 adds a
-**cinematic layer** on top of the existing pipeline (panel upload → narration/TTS →
-segment render → concat). **All 2.3 payloads keep working unchanged** — every new
-field is optional and falls back to the legacy behaviour.
+FFmpeg-based render backend for the Slideshow Studio frontend. Implements exactly the
+endpoints the frontend calls (`src/lib/renderer.ts`):
 
-## Run
+| Method | Path             | Purpose |
+| ------ | ---------------- | ------- |
+| GET    | `/health`        | health check (`{ ok: true }`) |
+| POST   | `/panel`         | multipart upload of one panel: `image`, optional `audio`, plus fields (`project_id`, `panel_id`, `index`, `duration`, `zoom`, `cropX`, `cropY`, `motion`, `transition`, `fps`, `cinematic`, `vfx_N`, `sfx_N`, `vfx_N_url`, `sfx_N_url`, fit fields) |
+| POST   | `/audio-zip`     | multipart `audioZip` + `project_id` — MP3s are sorted naturally and attached to panels in order (or by the number found in the filename) |
+| POST   | `/render`        | JSON **or** multipart (`payload` + `overlay` logo). Returns `{ jobId }` |
+| GET    | `/status/:jobId` | `{ status: queued\|rendering\|done\|error, progress, url }` |
+| POST   | `/stitch`        | `{ urls: [...] }` → downloads parts and concatenates them (stream copy) into one MP4 |
+| GET    | `/files/:name`   | serves rendered MP4s |
+
+No authentication — same as the frontend expects. CORS is fully open.
+
+## Features
+
+- Per-panel Ken Burns **motion**: Static, Slow Zoom In/Out, Slow Push In, Slow Pull Back,
+  Pan Left/Right/Up/Down, Focus Push, Fast Push, Fast Pan, Shake.
+- **Transitions**: Hard Cut, Cross Dissolve, Fade To Black, Fade From Black, Impact Cut, Flash Cut
+  (xfade + acrossfade; clip lengths are padded by the transition duration so narration stays in sync).
+- **VFX** overlay videos (looped, per-layer opacity, default 60%) and **SFX** audio
+  (mixed under narration, default volume 8%).
+- Output fit: `cover`, `contain`, `blur-pad`; per-panel manual zoom / crop focus.
+- Duration follows the narration MP3 when present, otherwise the requested duration.
+- Compression presets (`small` / `balanced` / `high`), optional loudness normalization,
+  optional watermark/logo overlay.
+- Output: 1920×1080 H.264 + AAC, `+faststart`.
+
+## Run locally
 
 ```bash
 npm install
-npm start            # PORT (default 3000), needs ffmpeg + ffprobe on PATH
+npm start          # http://localhost:8080
 ```
 
-## Endpoints
+Requires `ffmpeg` and `ffprobe` on PATH (the Dockerfile installs them).
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/health` | Liveness + ffmpeg availability |
-| POST | `/panel` | Upload one panel (image + narration/audio) — now accepts cinematic fields |
-| POST | `/audio-zip` | Bulk narration audio upload (unchanged) |
-| POST | `/render` | Start a full render, returns `{ jobId }` |
-| POST | `/render/preview` | **New.** Render only panels `fromPanel..toPanel` (1-based, inclusive) |
-| GET | `/status/:jobId` | Job progress, `warnings[]`, result URL |
-| POST | `/assets/vfx` | **New.** Upload a VFX asset (multipart `file` + `name`) |
-| POST | `/assets/sfx` | **New.** Upload an SFX/BGM asset (multipart `file` + `name`) |
-| GET | `/assets` | **New.** List both asset libraries |
+## Deploy on Railway
 
-Asset uploads are keyed by a **normalized semantic name** (`magic_blast`,
-`sword_slash`, …) and are idempotent: re-uploading the same name replaces the file.
-The frontend syncs every referenced asset before calling `/render`.
+1. Push this folder to a GitHub repository.
+2. Railway → **New Project → Deploy from GitHub repo** → pick the repo.
+3. Railway detects the `Dockerfile` (ffmpeg is installed inside it) and builds automatically.
+4. Under **Settings → Networking**, click **Generate Domain**.
+5. Copy the resulting `https://<your-app>.up.railway.app` URL into the app
+   (Render tab → backend URL, or per-project backend URL).
 
-## Panel fields (`POST /panel`)
+### Environment variables (all optional)
 
-Cinematic fields may arrive as nested JSON or flat form fields — both are accepted:
+| Variable        | Default            | Notes |
+| --------------- | ------------------ | ----- |
+| `PORT`          | `8080`             | Railway sets this automatically |
+| `DATA_DIR`      | `/tmp/render-data` | working + output directory |
+| `PUBLIC_URL`    | auto-detected      | set if the returned file URLs must be forced to a specific origin |
+| `MAX_UPLOAD_MB` | `200`              | per-file upload limit |
+| `RETENTION_MIN` | `240`              | minutes before rendered files / projects are cleaned up |
 
-```
-motion      "Slow Push In"
-transition  "Impact Cut"
-cinematic   {"motion":…,"transition":…,"vfx":{…},"sfx":{…}}
-vfx         {"name":"magic_blast","mode":"EVENT","offset":3.1,"enabled":true,"opacity":0.5}
-sfx         {"name":"magic_blast","offset":3.1,"volume":0.1,"enabled":true}
-```
+Storage is ephemeral on Railway — rendered files live long enough to download
+(the frontend downloads them automatically when a render finishes).
 
-Flat equivalents: `vfxName`/`vfx_name`, `vfxMode`, `vfxOffset`, `vfxOpacity`,
-`sfxName`/`sfx_name`, `sfxOffset`, `sfxVolume`.
+## Scaling
 
-- **VFX** — `mode: "EVENT"` composites the effect once at `offset` seconds from the
-  panel start; `"CONTINUOUS"` loops it across the whole panel. Default opacity `0.5`.
-  Alpha-capable sources (WebM/VP9, MOV ProRes 4444, APNG, GIF) are composited with
-  their alpha; other files are screen-blended.
-- **SFX** — delayed to `panel_start + offset` and mixed under the narration at
-  `volume` (linear, default `0.1`).
-- A name with no matching asset in the library renders the panel **clean** and adds
-  an entry to the job's `warnings[]` — it never fails the render.
-
-## Render options (`POST /render`, `POST /render/preview`)
-
-New optional keys (camelCase and snake_case both accepted):
-
-```
-vfxGlobal / vfx_global      master VFX switch (default true)
-sfxGlobal / sfx_global      master SFX switch (default true)
-vfxRanges / vfx_ranges      [{ id, name, fromPanel, toPanel, opacity }]
-bgmRanges / bgm_ranges      [{ id, track, fromPanel, toPanel, volume }]
-fromPanel, toPanel          1-based inclusive panel window (preview renders)
-```
-
-`vfxRanges` apply a CONTINUOUS effect across a panel span; `bgmRanges` mix a music
-track (resolved from the SFX library) across a span, ducked under the narration
-(default `0.1`). BGM is deliberately section-level, never per panel.
-
-## Vocabulary (`cinematic.js`)
-
-Exact strings shared with the frontend and the AI script. Anything else falls back
-to `Static` / `Hard Cut`.
-
-**MOTION_MAP** — Static · Slow Zoom In · Slow Zoom Out · Slow Push In · Slow Pull
-Back · Pan Left · Pan Right · Pan Up · Pan Down · Focus Push · Fast Push · Fast Pan
-· Shake
-
-**TRANSITION_MAP** — Hard Cut · Cross Dissolve · Fade To Black · Fade From Black ·
-Impact Cut (fast zoom punch + hard cut) · Flash Cut (2-frame white flash)
-
-When every panel uses `Hard Cut`, concat stays on the fast stream-copy path; any
-other transition triggers an `xfade` re-encode, with an automatic fallback to
-stream-copy if `xfade` fails.
-
-## Tuning (`motion.config.json`)
-
-Motion strengths and transition timings are data, not hard-coded: zoom percentages,
-pan distances, shake amplitude, transition durations, and the VFX/SFX/BGM defaults
-all live in `motion.config.json`. Edit and restart — no code change needed.
-
-## Safety notes
-
-- All user-supplied values interpolated into FFmpeg filter graphs go through the
-  `escFilterArg` / `escFilterPath` helpers in `cinematic.js`.
-- Concurrent FFmpeg spawns are bounded by `MAX_CONCURRENT_FFMPEG`.
-- Finished jobs are evicted past a cap; temp files are removed on failure paths.
+Deploy this same repo several times (or several Railway services) and paste each URL
+into the frontend's renderer list; the app splits panels across all of them and calls
+`/stitch` on the first one to join the parts.
