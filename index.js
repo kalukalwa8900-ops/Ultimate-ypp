@@ -12,9 +12,6 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const RENDERER_NAME = process.env.RENDERER_NAME || "renderer";
 
-// Railway Free: keep the Node process from competing with FFmpeg for memory.
-if (!process.env.NODE_OPTIONS) process.env.NODE_OPTIONS = "--max-old-space-size=512";
-
 // ================================
 // FFmpeg Detection & Validation
 // ================================
@@ -57,8 +54,6 @@ ffmpeg.setFfprobePath(FFPROBE_PATH);
 
 console.log(`✓ FFmpeg Path: ${FFMPEG_PATH}`);
 console.log(`✓ FFprobe Path: ${FFPROBE_PATH}`);
-console.log(`✓ Railway-safe renderer: resolution capped at 1280x720 unless ALLOW_HIGHER_RESOLUTION=1`);
-console.log(`✓ FFmpeg video threads: 2 | filter threads: 1 | concurrent render jobs: 1`);
 
 // ================================
 // Middleware
@@ -67,8 +62,8 @@ console.log(`✓ FFmpeg video threads: 2 | filter threads: 1 | concurrent render
 app.use(cors());
 
 // FIX #2: Increase Request Limits
-app.use(express.json({ limit: "20mb" }));
-app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+app.use(express.json({ limit: "2gb" }));
+app.use(express.urlencoded({ extended: true, limit: "2gb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/output", express.static(path.join(__dirname, "output")));
 
@@ -93,7 +88,7 @@ const UPLOADS_ROOT = path.join(__dirname, "uploads");
 const OUTPUT_ROOT  = path.join(__dirname, "output");
 const TEMP_ROOT    = path.join(__dirname, "temp");
 
-[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT].forEach((dir) => {
+[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT, path.join(__dirname, "vfx-library"), path.join(__dirname, "sfx-library")].forEach((dir) => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -123,33 +118,6 @@ function updateJob(jobId, patch) {
 
 function scheduleJobEviction(jobId) {
   setTimeout(() => { delete jobs[jobId]; }, 3 * 60 * 60 * 1000);
-}
-
-// Railway Free safety: only one heavy render job runs at a time.
-const renderQueue = [];
-let renderActive = false;
-
-function enqueueRender(jobId, task) {
-  renderQueue.push({ jobId, task });
-  updateJob(jobId, { status: "queued", queuePosition: renderQueue.length });
-  drainRenderQueue();
-}
-
-async function drainRenderQueue() {
-  if (renderActive || !renderQueue.length) return;
-  renderActive = true;
-  const item = renderQueue.shift();
-  try {
-    await item.task();
-  } catch (err) {
-    console.error(`[${item.jobId}] queued render error:`, err);
-    updateJob(item.jobId, { status: "error", error: err.message });
-    scheduleJobEviction(item.jobId);
-  } finally {
-    renderActive = false;
-    renderQueue.forEach((q, i) => updateJob(q.jobId, { queuePosition: i + 1 }));
-    setImmediate(drainRenderQueue);
-  }
 }
 
 // ================================
@@ -403,13 +371,18 @@ const zipUpload = multer({
 });
 
 // ================================
-// FPS: Configurable (default 20) — cinematic anime/manhua feeling, much faster render
+// Render constants — Railway Free safe defaults
 // ================================
+const OUTPUT_WIDTH = 1280;
+const OUTPUT_HEIGHT = 720;
+const DEFAULT_FPS = 20;
+const VIDEO_THREADS = 2;
+const FILTER_THREADS = 1;
+const DEFAULT_VFX_OPACITY = 0.60;
+const DEFAULT_SFX_VOLUME = 0.08;
 
-function getFps(value) {
-  const fps = Number(value);
-  if (!Number.isFinite(fps) || fps <= 0) return 20;
-  return Math.min(60, Math.max(1, Math.round(fps)));
+function getFps(_panelCount) {
+  return DEFAULT_FPS;
 }
 
 // ================================
@@ -438,53 +411,55 @@ function calculateFitInFrame(imageAspectRatio, frameWidth = 1280, frameHeight = 
 }
 
 // ================================
-// Ken Burns Animation — cinematic zoom in/out + slide left/right/up/down
-// 15fps · scale=2560 · zoom=1.18 · movement 10%–18% for alive anime feel
+// Ken Burns — 720p / 20 FPS / low-memory
 // ================================
-
-function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit", width = 1280, height = 720, fps = 20, motion = "") {
-  fps = getFps(fps);
-  width = Math.max(2, Math.round(Number(width) || 1280));
-  height = Math.max(2, Math.round(Number(height) || 720));
+function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit", motion = "") {
+  const fps = DEFAULT_FPS;
   const totalFrames = Math.max(1, Math.ceil(duration * fps));
-  const iw0 = width;
-  const ih0 = height;
   const normalised = String(aspectMode || "fit").toLowerCase().trim();
-  const requested = String(motion || "").toLowerCase().replace(/[_-]+/g, " ").trim();
+  const requested = String(motion || "").toLowerCase().trim();
 
-  // Static is intentionally cheap: no zoompan.
-  if (!requested || requested === "static") {
-    if (normalised === "cinematic") {
-      return `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1`;
-    }
-    return `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
-  }
-
-  const zIn = `scale=${iw0}:${ih0}:force_original_aspect_ratio=increase,crop=${iw0}:${ih0},zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=${fps},setsar=1`;
-  const zOut = `scale=${iw0}:${ih0}:force_original_aspect_ratio=increase,crop=${iw0}:${ih0},zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=${fps},setsar=1`;
-
-  if (requested.includes("zoom out") || requested.includes("pull back")) return zOut;
-  if (requested.includes("zoom in") || requested.includes("push in") || requested.includes("focus")) return zIn;
-
-  const panBase = `scale=${iw0}:${ih0}:force_original_aspect_ratio=increase,crop=${iw0}:${ih0},zoompan=z='1.12':`;
-  if (requested.includes("pan left") || requested.includes("slide left") || requested.includes("left")) {
-    return `${panBase}x='if(lte(on,1),iw*0.10,min(x+iw*0.06/${totalFrames},iw*0.16))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=${fps},setsar=1`;
-  }
-  if (requested.includes("pan right") || requested.includes("slide right") || requested.includes("right")) {
-    return `${panBase}x='if(lte(on,1),iw*0.16,max(x-iw*0.06/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=${fps},setsar=1`;
-  }
-  if (requested.includes("pan up") || requested.includes("slide up") || requested.includes("up")) {
-    return `${panBase}x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,min(y+ih*0.06/${totalFrames},ih*0.14))':d=${totalFrames}:s=${width}x${height}:fps=${fps},setsar=1`;
-  }
-  if (requested.includes("pan down") || requested.includes("slide down") || requested.includes("down")) {
-    return `${panBase}x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.14,max(y-ih*0.06/${totalFrames},ih*0.08))':d=${totalFrames}:s=${width}x${height}:fps=${fps},setsar=1`;
-  }
-  if (requested.includes("shake")) {
-    return `scale=${iw0}:${ih0}:force_original_aspect_ratio=increase,crop=${iw0}:${ih0},zoompan=z='1.08':x='iw/2-(iw/zoom/2)+sin(on*1.7)*iw*0.006':y='ih/2-(ih/zoom/2)+cos(on*1.9)*ih*0.006':d=${totalFrames}:s=${width}x${height}:fps=${fps},setsar=1`;
+  // Stable mapping so frontend can send simple words.
+  let motionIndex = idx % 6;
+  const map = {
+    "static": -1, "none": -1,
+    "zoom in": 0, "zoom_in": 0, "zoomin": 0,
+    "zoom out": 1, "zoom_out": 1, "zoomout": 1,
+    "slide left": 2, "slide_left": 2,
+    "slide right": 3, "slide_right": 3,
+    "slide up": 4, "slide_up": 4,
+    "slide down": 5, "slide_down": 5
+  };
+  if (Object.prototype.hasOwnProperty.call(map, requested)) motionIndex = map[requested];
+  if (motionIndex < 0) {
+    return `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
   }
 
-  // Unknown motion falls back to a deterministic zoom, never a costly random graph.
-  return zIn;
+  // Only ~1.25x working canvas instead of 2560px/4K intermediates.
+  const workW = 1600;
+  const fpsPart = `fps=${fps}`;
+  const out = `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}`;
+
+  if (normalised === "blurpad" || normalised === "blur-pad" || normalised === "blur_pad") {
+    // Keep blur-pad available, but use a modest blur to protect RAM.
+    const base = `split[bg][fg];[bg]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},gblur=sigma=12[bg2]`;
+    const fg = motionIndex === 0
+      ? `[fg]scale=${workW}:-1,zoompan=z='min(zoom+0.0007,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg2]`
+      : motionIndex === 1
+      ? `[fg]scale=${workW}:-1,zoompan=z='if(lte(on,1),1.12,max(zoom-0.0007,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg2]`
+      : `[fg]scale=${workW}:-1,zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg2]`;
+    return `${base};${fg};[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`;
+  }
+
+  const animations = [
+    `scale=${workW}:-1,zoompan=z='min(zoom+0.0007,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    `scale=${workW}:-1,zoompan=z='if(lte(on,1),1.12,max(zoom-0.0007,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    `scale=${workW}:-1,zoompan=z='1.10':x='if(lte(on,1),iw*0.10,min(x+iw*0.06/${totalFrames},iw*0.16))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    `scale=${workW}:-1,zoompan=z='1.10':x='if(lte(on,1),iw*0.16,max(x-iw*0.06/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    `scale=${workW}:-1,zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,min(y+ih*0.06/${totalFrames},ih*0.14))':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    `scale=${workW}:-1,zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.14,max(y-ih*0.06/${totalFrames},ih*0.08))':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`
+  ];
+  return animations[motionIndex];
 }
 
 // ================================
@@ -532,310 +507,214 @@ function buildVideoFilterChain(options = {}, baseFilter = "") {
 }
 
 // ================================
-// Create Segment (MP4) - OPTIMIZED for quality & speed
+// VFX/SFX helpers
 // ================================
-
-
-function parseOutputSettings(body = {}) {
-  let width = Number(body.width || body.outputWidth || body.output_width);
-  let height = Number(body.height || body.outputHeight || body.output_height);
-  const resolution = String(body.resolution || body.outputResolution || body.output_resolution || "").toLowerCase().trim();
-  if ((!width || !height) && resolution) {
-    const m = resolution.match(/(\d{3,5})\s*[x×]\s*(\d{3,5})/);
-    if (m) { width = Number(m[1]); height = Number(m[2]); }
-    else if (resolution === "720p" || resolution === "hd") { width = 1280; height = 720; }
-    else if (resolution === "1080p" || resolution === "fullhd" || resolution === "full-hd") { width = 1920; height = 1080; }
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
   }
-  if (!width || !height) { width = 1280; height = 720; }
-
-  // Railway-safe default/ceiling. The frontend may change FPS, but the
-  // low-memory renderer must not accidentally receive a 1080p/4K request.
-  // Set ALLOW_HIGHER_RESOLUTION=1 only on a machine with enough RAM.
-  const allowHigher = String(process.env.ALLOW_HIGHER_RESOLUTION || "").toLowerCase() === "1" ||
-                      String(process.env.ALLOW_HIGHER_RESOLUTION || "").toLowerCase() === "true";
-  if (!allowHigher) {
-    const scale = Math.min(1280 / width, 720 / height, 1);
-    width = Math.max(2, Math.round(width * scale));
-    height = Math.max(2, Math.round(height * scale));
-    // Keep the requested aspect ratio while guaranteeing even dimensions.
-    width -= width % 2;
-    height -= height % 2;
-  } else {
-    width = Math.max(2, Math.min(3840, Math.round(width)));
-    height = Math.max(2, Math.min(2160, Math.round(height)));
-  }
-  const fps = getFps(body.fps || body.frameRate || body.frame_rate || 20);
-  return { width, height, fps };
 }
 
-function resolveAssetPath(value, projectDir) {
-  if (!value) return null;
-  const raw = typeof value === "string" ? value : (value.path || value.file || value.assetPath || value.asset_path);
+function resolveAssetPath(asset, kind = "vfx", projectDir = null) {
+  if (!asset) return null;
+  const raw = typeof asset === "string" ? asset : (asset.path || asset.file || asset.assetPath || asset.localPath || asset.name || "");
   if (!raw) return null;
-  const candidates = [
-    raw,
-    path.join(projectDir || "", raw),
-    path.join(UPLOADS_ROOT, raw.replace(/^[/\\]+/, "")),
-    path.join(TEMP_ROOT, raw.replace(/^[/\\]+/, ""))
-  ];
-  for (const candidate of candidates) {
-    try {
-      const abs = path.resolve(candidate);
-      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return abs;
-    } catch (_) {}
+
+  const candidates = [];
+  if (path.isAbsolute(raw)) candidates.push(raw);
+  else {
+    if (projectDir) candidates.push(path.join(projectDir, raw));
+    candidates.push(path.join(UPLOADS_ROOT, raw));
+    candidates.push(path.join(__dirname, kind === "vfx" ? "vfx-library" : "sfx-library", raw));
+    candidates.push(path.join(TEMP_ROOT, raw));
+    candidates.push(raw);
   }
-  return null;
+  return candidates.find(p => fs.existsSync(p)) || null;
 }
 
-function normaliseAssetName(value) {
-  return safeName(String(value || "").toLowerCase(), "");
-}
-
-function getPanelCinematic(panel, renderOptions, projectDir) {
-  const c = panel.cinematic || panel.cinematicSettings || {};
-  const vfxRaw = c.vfx ?? panel.vfx;
-  const sfxRaw = c.sfx ?? panel.sfx;
-  const motion = c.motion ?? panel.motion ?? panel.cameraMotion ?? renderOptions.motion ?? "";
-  const vfxItems = [];
-  const sfxItems = [];
-
-  const addItem = (raw, collection) => {
-    if (!raw || String(raw).trim().toLowerCase() === "none" || String(raw).trim().toLowerCase() === "off") return;
-    const list = Array.isArray(raw) ? raw : [raw];
-    for (const item of list) {
-      if (typeof item === "string") collection.push({ name: item, path: null, opacity: 0.60, volume: 0.08 });
-      else if (item && typeof item === "object" && item.enabled !== false) collection.push({
-        name: item.name || item.id || "",
-        path: resolveAssetPath(item.path || item.file || item.assetPath || item.asset_path, projectDir),
-        opacity: Number(item.opacity ?? 0.60),
-        volume: Number(item.volume ?? 0.08),
-        start: Number(item.start ?? item.offset ?? 0),
-        loop: item.loop !== false
-      });
-    }
+function layerRange(layer) {
+  const start = Number(layer.startPanel ?? layer.start ?? layer.from ?? layer.panelStart ?? layer.panel ?? 1);
+  const end = Number(layer.endPanel ?? layer.end ?? layer.to ?? layer.panelEnd ?? start);
+  return {
+    start: Math.max(1, Math.floor(start || 1)),
+    end: Math.max(1, Math.floor(end || start || 1))
   };
-  addItem(vfxRaw, vfxItems);
-  addItem(sfxRaw, sfxItems);
-
-  // Range layers sent by the frontend can apply to this panel.
-  const panelNumber = Number(panel.index || 0) + 1;
-  for (const r of (renderOptions.vfxRanges || [])) {
-    const from = Number(r.fromPanel ?? r.from ?? 1), to = Number(r.toPanel ?? r.to ?? 0);
-    if (panelNumber >= from && panelNumber <= to) addItem(r.vfx || r.asset || r.name, vfxItems);
-  }
-  for (const r of (renderOptions.sfxRanges || [])) {
-    const from = Number(r.fromPanel ?? r.from ?? 1), to = Number(r.toPanel ?? r.to ?? 0);
-    if (panelNumber >= from && panelNumber <= to) addItem(r.sfx || r.asset || r.name, sfxItems);
-  }
-
-  // Resolve names through the library maps supplied by the frontend.
-  const vfxLib = renderOptions.vfxLibrary || renderOptions.vfxAssets || {};
-  const sfxLib = renderOptions.sfxLibrary || renderOptions.sfxAssets || {};
-  for (const item of vfxItems) {
-    if (!item.path && item.name) item.path = resolveAssetPath(vfxLib[item.name] || vfxLib[normaliseAssetName(item.name)], projectDir);
-    item.opacity = Math.max(0, Math.min(1, Number.isFinite(item.opacity) ? item.opacity : 0.60));
-  }
-  for (const item of sfxItems) {
-    if (!item.path && item.name) item.path = resolveAssetPath(sfxLib[item.name] || sfxLib[normaliseAssetName(item.name)], projectDir);
-    item.volume = Math.max(0, Math.min(1, Number.isFinite(item.volume) ? item.volume : 0.08));
-  }
-  return { vfxItems, sfxItems, motion };
 }
 
-const VFX_CACHE_ROOT = path.join(TEMP_ROOT, "vfx-cache");
-if (!fs.existsSync(VFX_CACHE_ROOT)) fs.mkdirSync(VFX_CACHE_ROOT, { recursive: true });
-
-async function getMediaDuration(filePath) {
-  return new Promise((resolve) => {
-    ffmpeg.ffprobe(filePath, (err, data) => {
-      if (err) return resolve(0);
-      const d = Number(data?.format?.duration || data?.streams?.find(s => Number(s.duration) > 0)?.duration || 0);
-      resolve(Number.isFinite(d) && d > 0 ? d : 0);
-    });
+function activeLayers(layers, panelNumber) {
+  return layers.filter(layer => {
+    if (!layer || layer.enabled === false || layer.enabled === "false") return false;
+    const r = layerRange(layer);
+    return panelNumber >= r.start && panelNumber <= r.end;
   });
 }
 
-async function prepareVfxAsset(sourcePath, width, height, fps) {
-  if (!sourcePath || !fs.existsSync(sourcePath)) return null;
-  const stat = fs.statSync(sourcePath);
+async function prepareVfxAsset(inputPath, fps = DEFAULT_FPS) {
+  if (!inputPath || !fs.existsSync(inputPath)) {
+    throw new Error(`VFX asset not found: ${inputPath || "empty"}`);
+  }
+
+  const stat = fs.statSync(inputPath);
   const key = crypto.createHash("sha1")
-    .update(`${path.resolve(sourcePath)}|${stat.size}|${stat.mtimeMs}|${width}x${height}|${fps}`)
+    .update(`${inputPath}|${stat.size}|${stat.mtimeMs}|${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}|${fps}`)
     .digest("hex");
-  const out = path.join(VFX_CACHE_ROOT, `${key}.webm`);
-  if (fs.existsSync(out) && fs.statSync(out).size > 0) return out;
+  const cacheDir = path.join(__dirname, "vfx-library", "cache");
+  fs.mkdirSync(cacheDir, { recursive: true });
 
-  const ext = path.extname(sourcePath).toLowerCase();
-  const isImage = [".png",".jpg",".jpeg",".webp"].includes(ext);
-  const duration = isImage ? 8 : await getMediaDuration(sourcePath);
-  const safeDuration = Math.max(1, Math.min(60, duration || 8));
+  const outPath = path.join(cacheDir, `${key}.webm`);
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) return outPath;
 
-  const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba,fps=${fps}`;
-  const args = ["-hide_banner","-loglevel","error","-y"];
+  const ext = path.extname(inputPath).toLowerCase();
+  const isImage = [".png", ".jpg", ".jpeg", ".webp"].includes(ext);
+  const args = ["-hide_banner", "-loglevel", "error"];
+
   if (isImage) {
-    args.push("-loop","1","-framerate",String(fps),"-i",sourcePath);
+    args.push("-loop", "1", "-framerate", String(fps), "-i", inputPath, "-t", "5");
   } else {
-    args.push("-stream_loop","-1","-i",sourcePath);
+    args.push("-i", inputPath);
   }
-  args.push("-vf",vf,"-t",String(safeDuration),"-an","-c:v","libvpx-vp9","-pix_fmt","yuva420p","-crf","32","-b:v","0",
-           "-deadline","realtime","-cpu-used","5","-threads:v","2","-row-mt","0",out);
-  await spawnFfmpeg(args, `prepare VFX ${path.basename(sourcePath)}`);
-  return out;
+
+  args.push(
+    "-vf", `fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=yuva420p`,
+    "-an",
+    "-c:v", "libvpx-vp9",
+    "-b:v", "800k",
+    "-deadline", "realtime",
+    "-cpu-used", "5",
+    "-auto-alt-ref", "0",
+    "-threads", String(VIDEO_THREADS),
+    "-y", outPath
+  );
+
+  console.log(`[vfx] preparing ${path.basename(inputPath)} → 720p/${fps}fps`);
+  await spawnFfmpeg(args, `prepare VFX ${path.basename(inputPath)}`);
+  return outPath;
 }
 
-function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const { width, height, fps } = parseOutputSettings(renderOptions);
-      const cinematic = renderOptions.cinematic || {};
-      const motion = cinematic.motion || renderOptions.motion || "";
-      const baseFilter = getKenBurnsFilter(
-        idx, duration, panelCount, aspectMode, width, height, fps, motion
-      );
+// ================================
+// Create Segment — 720p / 20 FPS / Ken Burns + optional VFX/SFX
+// ================================
+async function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, motion: motionName, vfxLayers = [], sfxLayers = [], renderOptions = {} }) {
+  const fps = DEFAULT_FPS;
+  const panelNumber = idx + 1;
 
-      const hasAudio = audioPath && fs.existsSync(audioPath);
-      const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-      console.log(`[${RENDERER_NAME}][seg${idx + 1}] START job=${jobId} ${width}x${height}@${fps} dur=${duration}s mem=${memMB}MB threads=2 filter_threads=1`);
+  // VFX is normalized once and reused from cache.
+  const preparedVfx = [];
+  for (const layer of vfxLayers) {
+    const source = resolveAssetPath(layer, "vfx", renderOptions.projectDir);
+    if (!source) throw new Error(`Panel ${panelNumber}: VFX asset not found: ${layer?.name || layer?.file || layer?.path || "unknown"}`);
+    const prepared = await prepareVfxAsset(source, fps);
+    preparedVfx.push({ layer, path: prepared });
+  }
 
-      const cmd = ffmpeg()
-        .setFfmpegPath(FFMPEG_PATH)
-        .input(imagePath)
-        .inputOptions(["-loop", "1", "-framerate", String(fps)]);
+  const preparedSfx = [];
+  for (const layer of sfxLayers) {
+    const source = resolveAssetPath(layer, "sfx", renderOptions.projectDir);
+    if (!source) throw new Error(`Panel ${panelNumber}: SFX asset not found: ${layer?.name || layer?.file || layer?.path || "unknown"}`);
+    preparedSfx.push({ layer, path: source });
+  }
 
-      if (hasAudio) cmd.input(audioPath);
-      else {
-        cmd.input(`anullsrc=channel_layout=stereo:sample_rate=48000`)
-          .inputOptions(["-f","lavfi","-t",String(duration)]);
-      }
+  const motion = renderOptions.motion || motionName || "";
+  const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode, motion);
+  const hasAudio = audioPath && fs.existsSync(audioPath);
 
-      // Resolve requested VFX and SFX. Missing assets are a hard error; never silently skip them.
-      const projectDir = renderOptions.projectDir || "";
-      const preparedVfx = [];
-      for (const item of (cinematic.vfxItems || [])) {
-        const source = item.path;
-        if (!source) throw new Error(`Panel ${idx + 1}: VFX asset not found: ${item.name || "unnamed"}`);
-        const cached = await prepareVfxAsset(source, width, height, fps);
-        if (!cached) throw new Error(`Panel ${idx + 1}: unable to prepare VFX: ${item.name || source}`);
-        preparedVfx.push({ ...item, path: cached });
-      }
+  const cmd = ffmpeg()
+    .setFfmpegPath(FFMPEG_PATH)
+    .input(imagePath)
+    .inputOptions(["-loop", "1", "-framerate", String(fps)]);
 
-      // Add prepared VFX inputs first. They are already normalized to target resolution/FPS.
-      for (const item of preparedVfx) {
-        cmd.input(item.path).inputOptions(["-stream_loop","-1"]);
-      }
+  if (hasAudio) {
+    cmd.input(audioPath);
+  } else {
+    cmd.input(`aevalsrc=0:channel_layout=stereo:sample_rate=48000:duration=${duration}`)
+      .inputOptions(["-f", "lavfi"]);
+  }
 
-      // Add SFX inputs after VFX.
-      const sfxInputs = [];
-      for (const item of (cinematic.sfxItems || [])) {
-        if (!item.path || !fs.existsSync(item.path)) {
-          throw new Error(`Panel ${idx + 1}: SFX asset not found: ${item.name || "unnamed"}`);
-        }
-        cmd.input(item.path).inputOptions(["-stream_loop","-1"]);
-        sfxInputs.push(item);
-      }
+  // Every VFX/SFX is a reusable range layer. The same asset can span many panels.
+  for (const v of preparedVfx) {
+    cmd.input(v.path).inputOptions(["-stream_loop", "-1"]);
+  }
+  for (const a of preparedSfx) {
+    cmd.input(a.path).inputOptions(["-stream_loop", "-1"]);
+  }
 
-      const vfxInputStart = 2;
-      const sfxInputStart = 2 + preparedVfx.length;
-      let complex = `[0:v]${baseFilter}[v0]`;
-      let lastV = "[v0]";
+  const filter = [];
+  filter.push(`[0:v]${kenBurns}[base]`);
+  let current = "base";
 
-      // Composite all VFX overlays at target resolution. Each source was normalized once and cached.
-      for (let i = 0; i < preparedVfx.length; i++) {
-        const item = preparedVfx[i];
-        const inputIndex = vfxInputStart + i;
-        const opacity = Math.max(0, Math.min(1, Number(item.opacity ?? 0.60)));
-        const label = `[vfx${i}]`;
-        complex += `;[${inputIndex}:v]format=rgba,colorchannelmixer=aa=${opacity}${label}`;
-        complex += `;${lastV}${label}overlay=0:0:format=auto[v${i + 1}]`;
-        lastV = `[v${i + 1}]`;
-      }
+  // VFX compositing. Opacity is applied per layer and defaults to 60%.
+  preparedVfx.forEach((v, n) => {
+    const inputIndex = 2 + n;
+    const opacity = Math.max(0.05, Math.min(1, Number(v.layer.opacity ?? DEFAULT_VFX_OPACITY)));
+    const label = `v${n}`;
+    filter.push(`[${inputIndex}:v]fps=${fps},setpts=PTS-STARTPTS,format=rgba,colorchannelmixer=aa=${opacity}[${label}]`);
+    filter.push(`[${current}][${label}]overlay=0:0:shortest=0:format=auto[ov${n}]`);
+    current = `ov${n}`;
+  });
+  filter.push(`[${current}]format=yuv420p[outv]`);
 
-      // SFX + narration audio mix.
-      let audioMap = "1:a";
-      if (sfxInputs.length) {
-        const sfxLabels = [];
-        for (let i = 0; i < sfxInputs.length; i++) {
-          const inputIndex = sfxInputStart + i;
-          const item = sfxInputs[i];
-          const vol = Math.max(0, Math.min(1, Number(item.volume ?? 0.08)));
-          const label = `[sfx${i}]`;
-          complex += `;[${inputIndex}:a]atrim=0:${duration},asetpts=N/SR/TB,volume=${vol}${label}`;
-          sfxLabels.push(label);
-        }
-        complex += `;[1:a]atrim=0:${duration},asetpts=N/SR/TB[voice];[voice]${sfxLabels.join("")}amix=inputs=${1 + sfxLabels.length}:duration=first:dropout_transition=0:normalize=0[aout]`;
-        audioMap = "[aout]";
-      } else {
-        complex += `;[1:a]atrim=0:${duration},asetpts=N/SR/TB[aout]`;
-        audioMap = "[aout]";
-      }
+  // SFX are mixed quietly under narration. Each active layer loops for the panel duration.
+  const audioInputStart = 2 + preparedVfx.length;
+  const audioLabels = ["[1:a]aresample=48000,asetpts=PTS-STARTPTS[narr]"];
+  preparedSfx.forEach((a, n) => {
+    const inputIndex = audioInputStart + n;
+    const volume = Math.max(0, Math.min(0.08, Number(a.layer.volume ?? a.layer.gain ?? DEFAULT_SFX_VOLUME)));
+    audioLabels.push(`[${inputIndex}:a]aresample=48000,asetpts=PTS-STARTPTS,volume=${volume.toFixed(4)},atrim=duration=${duration.toFixed(3)}[s${n}]`);
+  });
+  if (preparedSfx.length) {
+    filter.push(...audioLabels);
+    filter.push(`[narr]${preparedSfx.map((_, n) => `[s${n}]`).join("")}amix=inputs=${preparedSfx.length + 1}:duration=first:dropout_transition=0:normalize=0[aout]`);
+  } else {
+    filter.push("[1:a]aresample=48000,asetpts=PTS-STARTPTS[aout]");
+  }
 
-      complex += `;${lastV}format=yuv420p[vout]`;
+  const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  console.log(`[${RENDERER_NAME}][seg${idx}] START panel=${panelNumber} dur=${duration.toFixed(2)}s VFX=${preparedVfx.length} SFX=${preparedSfx.length} mem=${memMB}MB`);
 
-      const outputOpts = [
-        "-filter_complex", complex,
-        "-map", "[vout]",
-        "-map", audioMap,
-        "-c:v", renderOptions.videoCodec || "libx264",
-        "-pix_fmt", renderOptions.pixFmt || "yuv420p",
-        "-r", String(fps),
-        "-g", String(Math.max(2, fps * 2)),
-        "-crf", String(Math.max(18, Math.min(26, parseInt(renderOptions.crf,10) || 21))),
-        "-preset", renderOptions.preset || "veryfast",
-        // Explicit per-stream thread limits. Do not rely on FFmpeg's
-        // automatic CPU detection on Railway.
-        "-threads:v", "2",
-        "-threads:a", "1",
-        "-filter_threads", "1",
-        "-filter_complex_threads", "1",
-        "-x264-params", "threads=2:lookahead_threads=1",
-        "-c:a", "aac",
-        "-b:a", renderOptions.audioBitrate || "160k",
-        "-t", String(duration),
-        "-shortest",
-        "-movflags", renderOptions.movflags || "+faststart",
-        "-y"
-      ];
+  const outputOpts = [
+    "-filter_complex", filter.join(";"),
+    "-map", "[outv]",
+    "-map", "[aout]",
+    "-c:v", "libx264",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-g", String(fps * 2),
+    "-crf", "21",
+    "-preset", "veryfast",
+    "-threads", String(VIDEO_THREADS),
+    "-filter_threads", String(FILTER_THREADS),
+    "-filter_complex_threads", String(FILTER_THREADS),
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-shortest",
+    "-t", String(duration),
+    "-movflags", "+faststart",
+    "-y"
+  ];
 
-      const proc = cmd.outputOptions(outputOpts).output(outPath);
-      proc.on("start", command => console.log(`[${RENDERER_NAME}][seg${idx + 1}] ${command}`));
-      proc.on("progress", p => {
-        if (p.percent && Math.round(p.percent) % 25 === 0) {
-          console.log(`[${RENDERER_NAME}][seg${idx + 1}] ${Math.round(p.percent)}%`);
-        }
-      });
-      proc.on("end", () => {
-        const endMem = Math.round(process.memoryUsage().rss / 1024 / 1024);
-        console.log(`[${RENDERER_NAME}][seg${idx + 1}] END mem=${endMem}MB`);
+  return new Promise((resolve, reject) => {
+    cmd.outputOptions(outputOpts).output(outPath)
+      .on("start", command => console.log(`[seg${idx}] ${command}`))
+      .on("end", () => {
+        const memAfter = Math.round(process.memoryUsage().rss / 1024 / 1024);
+        console.log(`[${RENDERER_NAME}][seg${idx}] END mem=${memAfter}MB`);
         resolve();
-      });
-      proc.on("error", err => {
-        const endMem = Math.round(process.memoryUsage().rss / 1024 / 1024);
-        reject(new Error(`FFmpeg panel ${idx + 1} failed (mem=${endMem}MB): ${err.message}`));
-      });
-      proc.run();
-    } catch (err) {
-      reject(err);
-    }
+      })
+      .on("error", err => reject(new Error(`Panel ${panelNumber} FFmpeg failed: ${err.message}`)))
+      .run();
   });
 }
-
-// ================================
-// createSegment with retry + skip on failure
-// ================================
 
 async function createSegmentSafe(opts) {
-  let lastErr = null;
-  const attempts = 1;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      await createSegment(opts);
-      return { success: true };
-    } catch (err) {
-      lastErr = err;
-      console.error(`[seg${opts.idx + 1}] attempt ${attempt}/${attempts} failed: ${err.message}`);
-      if (attempt < attempts) await new Promise(r => setTimeout(r, 1500));
-    }
-  }
-  throw lastErr;
+  // Do not silently skip panels. One failed panel must fail the job so the final
+  // video never silently loses narration/images.
+  await createSegment(opts);
+  return { success: true };
 }
 
 // ================================
@@ -844,31 +723,53 @@ async function createSegmentSafe(opts) {
 
 function spawnFfmpeg(args, description = "") {
   return new Promise((resolve, reject) => {
-    console.log(`[ffmpeg] Running: ${FFMPEG_PATH} ${args.join(" ")}`);
-    const proc = spawn(FFMPEG_PATH, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stderr = "";
-    proc.stdout?.on("data", () => {});
-    proc.stderr?.on("data", data => {
-      const chunk = data.toString();
-      stderr = (stderr + chunk).slice(-12000);
-      if (process.env.FFMPEG_LOG === "1") console.log(`[ffmpeg] ${chunk.trimEnd()}`);
+    console.log(`[ffmpeg] Running: ffmpeg ${args.join(" ")}`);
+    const proc = spawn(FFMPEG_PATH, args, {
+      stdio: ["pipe", "pipe", "pipe"]
     });
-    proc.on("error", err => reject(new Error(`FFmpeg spawn failed: ${description}: ${err.message}`)));
-    proc.on("close", (code, signal) => {
-      if (code === 0) return resolve({ success: true, stderr });
-      const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-      const reason = signal ? `signal=${signal}` : `exitCode=${code}`;
-      reject(new Error(`FFmpeg ${description} failed (${reason}, memory=${memMB}MB). ${stderr.slice(-4000)}`));
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr?.on("data", (data) => {
+      stderr += data.toString();
+      console.log(`[ffmpeg] stderr: ${data}`);
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        console.log(`[ffmpeg] ✓ ${description || "Command"} succeeded`);
+        resolve({ success: true, stdout, stderr });
+      } else {
+        const isOOM = stderr.includes("Cannot allocate memory") ||
+                      stderr.includes("Out of memory") ||
+                      stderr.includes("ENOMEM") ||
+                      code === 137;
+        const label = isOOM ? "❌ OOM KILL" : "✗";
+        const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+        const err = new Error(`FFmpeg ${isOOM ? "OOM" : `failed (code ${code})`}: ${description} — mem=${memMB}MB\n${stderr.slice(-800)}`);
+        console.error(`[ffmpeg] ${label} ${description} code=${code} mem=${memMB}MB`);
+        reject(err);
+      }
+    });
+
+    proc.on("error", (err) => {
+      console.error(`[ffmpeg] spawn error:`, err.message);
+      reject(err);
     });
   });
 }
 
 // ================================
 // CONCAT — Lossless stream-copy (no re-render, no quality loss, instant)
-// Segments already encoded at the requested FPS/CRF; just join them.
+// Segments already encoded at 15fps/CRF-21; just join them.
 // ================================
 
-async function concatSegments(segPaths, durations, outPath, renderOptions = {}) {
+async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
   const n = segPaths.length;
   const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
   console.log(`\n[concat] START (stream-copy, no re-render) — ${n} segments — mem=${memMB}MB`);
@@ -967,7 +868,24 @@ app.get("/health", (req, res) => {
     status: "ok",
     renderer: RENDERER_NAME,
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    queueLength: renderQueue.length,
+    renderBusy,
     timestamp: new Date().toISOString()
+  });
+});
+
+
+app.get("/render-config", (_req, res) => {
+  res.json({
+    success: true,
+    width: OUTPUT_WIDTH,
+    height: OUTPUT_HEIGHT,
+    fps: DEFAULT_FPS,
+    videoThreads: VIDEO_THREADS,
+    filterThreads: FILTER_THREADS,
+    vfxOpacityDefault: DEFAULT_VFX_OPACITY,
+    sfxVolumeDefault: DEFAULT_SFX_VOLUME,
+    transitions: false
   });
 });
 
@@ -1011,11 +929,11 @@ app.post(
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       });
 
-      // Keep uploads on disk; do not load large images into RAM.
-      const imagePath = path.join(panelDir, `image${extFor(req.files.image[0], ".jpg")}`);
-      fs.copyFileSync(req.files.image[0].path, imagePath);
-      fs.unlinkSync(req.files.image[0].path);
-
+      // FIX #1: Read from disk instead of buffer
+      const imageBuffer = fs.readFileSync(req.files.image[0].path);
+      const imagePath = path.join(panelDir, `image.jpg`);
+      fs.writeFileSync(imagePath, imageBuffer);
+      fs.unlinkSync(req.files.image[0].path); // Clean up temp file
 
       let audioPath = null;
       let audioFileName = null;
@@ -1029,16 +947,6 @@ app.post(
       }
 
       const index = Number(req.body.index || 0);
-      const parseMaybeJson = (v) => {
-        if (v == null || v === "") return null;
-        try { return typeof v === "string" ? JSON.parse(v) : v; } catch (_) { return v; }
-      };
-
-      // Cinematic instructions can be stored with the panel and executed during render.
-      const cinematic = parseMaybeJson(req.body.cinematic || req.body.cinematicSettings);
-      const vfx = parseMaybeJson(req.body.vfx);
-      const sfx = parseMaybeJson(req.body.sfx);
-      const motion = req.body.motion || req.body.cameraMotion || null;
 
       // Per-panel manual zoom/crop (frontend sends 0-100 % focus or 0-1)
       const zoomVal = Math.max(1, Math.min(3, Number(req.body.zoom || req.body.zoomFactor || 1)));
@@ -1053,15 +961,11 @@ app.post(
           index,
           duration,
           narration,
-          image:       path.basename(imagePath),
+          image:       "image.jpg",
           audio:       audioFileName,
           zoom:        zoomVal,
           focusX,
           focusY,
-          cinematic,
-          vfx,
-          sfx,
-          motion,
           uploaded_at: new Date().toISOString()
         }, null, 2)
       );
@@ -1103,9 +1007,10 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
       return res.status(404).json({ success: false, error: "Project not found. Upload panels first." });
     }
 
-    // Open ZIP directly from disk; do not load the entire archive into RAM.
-    const zip = new AdmZip(req.file.path);
-    fs.unlinkSync(req.file.path);
+    // FIX #1: Read from disk instead of memory buffer
+    const zipBuffer = fs.readFileSync(req.file.path);
+    const zip = new AdmZip(zipBuffer);
+    fs.unlinkSync(req.file.path); // Clean up temp file
     
     const entries = zip.getEntries();
 
@@ -1161,15 +1066,7 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
       const panel = panelFolders[i];
       const outAudio = path.join(panel.dir, "audio.mp3");
 
-      // Extract directly to disk instead of keeping the whole MP3 buffer
-      // alive in Node memory.
-      if (typeof zip.extractEntryTo === "function") {
-        zip.extractEntryTo(audio.entry, panel.dir, false, true);
-        const extracted = path.join(panel.dir, path.basename(audio.file));
-        if (extracted !== outAudio) fs.renameSync(extracted, outAudio);
-      } else {
-        fs.writeFileSync(outAudio, audio.entry.getData());
-      }
+      fs.writeFileSync(outAudio, audio.entry.getData());
 
       panel.meta.audio = "audio.mp3";
       panel.meta.audio_source = "zip";
@@ -1205,49 +1102,91 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
 
 
 // ================================
-// CINEMATIC ASSET LIBRARY UPLOADS
+// Railway Free safety: one render job at a time
 // ================================
+const renderQueue = [];
+let renderBusy = false;
 
-const LIBRARY_ROOT = path.join(UPLOADS_ROOT, "library");
-const VFX_LIBRARY_ROOT = path.join(LIBRARY_ROOT, "vfx");
-const SFX_LIBRARY_ROOT = path.join(LIBRARY_ROOT, "sfx");
-[VFX_LIBRARY_ROOT, SFX_LIBRARY_ROOT].forEach(d => {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+function enqueueRender(fn) {
+  renderQueue.push(fn);
+  processRenderQueue();
+}
+
+async function processRenderQueue() {
+  if (renderBusy || !renderQueue.length) return;
+  renderBusy = true;
+  const next = renderQueue.shift();
+  try {
+    await next();
+  } catch (err) {
+    console.error("[queue] render task failed:", err.message);
+  } finally {
+    renderBusy = false;
+    setImmediate(processRenderQueue);
+  }
+}
+
+
+// ================================
+// VFX / SFX local libraries
+// ================================
+const vfxLibraryStorage = multer.diskStorage({
+  destination: path.join(__dirname, "vfx-library"),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || ".webm";
+    const base = safeName(path.basename(file.originalname, path.extname(file.originalname)), "vfx");
+    cb(null, `${base}_${Date.now()}${ext}`);
+  }
+});
+const sfxLibraryStorage = multer.diskStorage({
+  destination: path.join(__dirname, "sfx-library"),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || ".mp3";
+    const base = safeName(path.basename(file.originalname, path.extname(file.originalname)), "sfx");
+    cb(null, `${base}_${Date.now()}${ext}`);
+  }
 });
 
-const cinematicAssetUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, file, cb) => {
-      const type = String(_req.body?.type || "").toLowerCase() === "sfx" ? SFX_LIBRARY_ROOT : VFX_LIBRARY_ROOT;
-      cb(null, type);
-    },
-    filename: (_req, file, cb) => {
-      const name = safeName(_req.body?.name || path.parse(file.originalname).name, "asset");
-      const ext = path.extname(file.originalname).toLowerCase() || ".bin";
-      cb(null, `${name}${ext}`);
-    }
-  }),
+const vfxLibraryUpload = multer({
+  storage: vfxLibraryStorage,
   limits: { fileSize: 100 * 1024 * 1024, files: 1 }
 });
+const sfxLibraryUpload = multer({
+  storage: sfxLibraryStorage,
+  limits: { fileSize: 50 * 1024 * 1024, files: 1 }
+});
 
-app.post("/library/asset", cinematicAssetUpload.single("file"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ success: false, error: "file required" });
-    const type = String(req.body.type || "").toLowerCase() === "sfx" ? "sfx" : "vfx";
-    const root = type === "sfx" ? SFX_LIBRARY_ROOT : VFX_LIBRARY_ROOT;
-    const filePath = path.resolve(req.file.path);
-    if (!filePath.startsWith(path.resolve(root) + path.sep)) {
-      return res.status(400).json({ success: false, error: "invalid asset path" });
-    }
-    return res.json({
-      success: true,
-      type,
-      name: path.parse(req.file.filename).name,
-      path: filePath
-    });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
+function listLibrary(dir, kind) {
+  fs.mkdirSync(dir, { recursive: true });
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter(e => e.isFile())
+    .filter(e => !e.name.startsWith("."))
+    .filter(e => kind === "vfx"
+      ? /\.(webm|mp4|mov|mkv|png|webp|jpg|jpeg)$/i.test(e.name)
+      : /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(e.name))
+    .map(e => ({
+      name: e.name,
+      path: path.join(dir, e.name),
+      size: fs.statSync(path.join(dir, e.name)).size
+    }));
+}
+
+app.get("/library/vfx", (_req, res) => {
+  res.json({ success: true, items: listLibrary(path.join(__dirname, "vfx-library"), "vfx") });
+});
+
+app.get("/library/sfx", (_req, res) => {
+  res.json({ success: true, items: listLibrary(path.join(__dirname, "sfx-library"), "sfx") });
+});
+
+app.post("/library/vfx", vfxLibraryUpload.single("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, error: "VFX file required" });
+  res.json({ success: true, name: req.file.filename, path: req.file.path });
+});
+
+app.post("/library/sfx", sfxLibraryUpload.single("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, error: "SFX file required" });
+  res.json({ success: true, name: req.file.filename, path: req.file.path });
 });
 
 // ================================
@@ -1288,8 +1227,8 @@ function handleRender(req, res) {
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
 
-    setImmediate(() => {
-      enqueueRender(jobId, () => renderFromProject(req, jobId));
+    enqueueRender(async () => {
+      await renderFromProject(req, jobId);
     });
     return;
   }
@@ -1306,8 +1245,8 @@ function handleRender(req, res) {
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
 
-    setImmediate(() => {
-      enqueueRender(jobId, () => renderFromMultipart(req, jobId));
+    enqueueRender(async () => {
+      await renderFromMultipart(req, jobId);
     });
   });
 }
@@ -1339,21 +1278,17 @@ app.post("/render", (req, res) => {
 // ================================
 
 function extractRenderOptions(body) {
-  // Map frontend outputFit -> backend aspectMode
-  //   "cover"    -> "cinematic"  (fills frame; allows crop)
-  //   "contain"  -> "fit"        (letterbox, full image visible)
-  //   "blur-pad" -> "blurpad"    (blurred-scaled bg + full image overlay)
   let aspectMode = String(body.aspectMode || body.aspect_mode || "").toLowerCase();
   if (!aspectMode) {
     const fit = String(body.outputFit || body.output_fit || body.fit || "").toLowerCase();
-    if (fit === "blur-pad" || String(body.padMode || body.pad_mode || "").toLowerCase() === "blur" || body.blurBackground === true || body.blur_background === true || body.blurBackground === "true" || body.blur_background === "true") {
+    if (fit === "blur-pad" || String(body.padMode || body.pad_mode || "").toLowerCase() === "blur" ||
+        body.blurBackground === true || body.blur_background === true || body.blurBackground === "true" || body.blur_background === "true") {
       aspectMode = "blurpad";
     } else if (fit === "contain") aspectMode = "fit";
-    else if (fit === "cover")    aspectMode = "cinematic";
+    else if (fit === "cover") aspectMode = "cinematic";
     else aspectMode = "fit";
   }
 
-  // Overlay/watermark metadata
   let overlay = null;
   try {
     const raw = body.overlay || body.overlayMeta;
@@ -1361,37 +1296,32 @@ function extractRenderOptions(body) {
   } catch (_) { overlay = null; }
   if (overlay && (overlay.enabled === false || overlay.enabled === "false")) overlay = null;
 
-  const output = parseOutputSettings(body);
-  let vfxRanges = [], sfxRanges = [];
-  try { vfxRanges = typeof body.vfxRanges === "string" ? JSON.parse(body.vfxRanges) : (body.vfxRanges || []); } catch (_) {}
-  try { sfxRanges = typeof body.sfxRanges === "string" ? JSON.parse(body.sfxRanges) : (body.sfxRanges || []); } catch (_) {}
-  let vfxLibrary = {}, sfxLibrary = {};
-  try { vfxLibrary = typeof body.vfxLibrary === "string" ? JSON.parse(body.vfxLibrary) : (body.vfxLibrary || {}); } catch (_) {}
-  try { sfxLibrary = typeof body.sfxLibrary === "string" ? JSON.parse(body.sfxLibrary) : (body.sfxLibrary || {}); } catch (_) {}
+  // Simple range-based cinematic layers. Frontend can send JSON or arrays.
+  const vfxLayers = parseJsonArray(body.vfxLayers || body.vfx_layers || body.vfx);
+  const sfxLayers = parseJsonArray(body.sfxLayers || body.sfx_layers || body.sfx);
 
   return {
-    ...output,
-    smoothAudio:   body.smoothAudio === true || body.smoothAudio === "true",
-    crf:           body.crf || 21,
-    preset:        body.preset || "faster",
-    maxrate:       body.maxrate || "",
-    bufsize:       body.bufsize || "",
-    audioBitrate:  body.audioBitrate || "192k",
-    movflags:      body.movflags || "+faststart",
-    pixFmt:        body.pixFmt || "yuv420p",
-    videoCodec:    body.videoCodec || "libx264",
-    zoom:          body.zoom || null,
-    zoomFactor:    body.zoomFactor || 1.0,
-    cropX:         body.cropX || null,
-    cropY:         body.cropY || null,
-    focusX:        body.focusX || 0.5,
-    focusY:        body.focusY || 0.5,
+    smoothAudio: false,
+    crf: 21,
+    preset: "veryfast",
+    maxrate: "",
+    bufsize: "",
+    audioBitrate: "128k",
+    movflags: "+faststart",
+    pixFmt: "yuv420p",
+    videoCodec: "libx264",
+    zoom: null,
+    zoomFactor: 1.0,
+    cropX: null,
+    cropY: null,
+    focusX: 0.5,
+    focusY: 0.5,
     aspectMode,
     overlay,
-    vfxRanges,
-    sfxRanges,
-    vfxLibrary,
-    sfxLibrary
+    motion: body.motion || "",
+    vfxLayers,
+    sfxLayers,
+    projectDir: null
   };
 }
 
@@ -1441,18 +1371,7 @@ async function renderFromProject(req, jobId) {
 
   if (orderedRefs.length) {
     panels = orderedRefs
-      .map((ref, i) => {
-        const panel = readPanel(ref.ref || ref.panel_id || ref.id || ref.panel, i);
-        if (!panel) return null;
-        if (ref && typeof ref === "object") {
-          if (ref.cinematic != null) panel.cinematic = ref.cinematic;
-          if (ref.vfx != null) panel.vfx = ref.vfx;
-          if (ref.sfx != null) panel.sfx = ref.sfx;
-          if (ref.motion != null) panel.motion = ref.motion;
-          if (ref.cameraMotion != null) panel.cameraMotion = ref.cameraMotion;
-        }
-        return panel;
-      })
+      .map((p, i) => readPanel(p.ref || p.panel_id || p.id || p.panel, i))
       .filter(Boolean);
   } else {
     const folders = fs
@@ -1488,6 +1407,18 @@ async function renderFromProject(req, jobId) {
     console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
     await validateRenderPanels(panels);
 
+    // Pre-normalize every global VFX asset once before panel rendering.
+    // The normalized 720p/20fps asset is cached and reused for all matching ranges.
+    const uniqueVfx = new Map();
+    for (const layer of renderOptions.vfxLayers || []) {
+      const source = resolveAssetPath(layer, "vfx", projectDir);
+      if (!source) throw new Error(`VFX asset not found: ${layer?.name || layer?.file || layer?.path || "unknown"}`);
+      uniqueVfx.set(source, layer);
+    }
+    for (const source of uniqueVfx.keys()) {
+      await prepareVfxAsset(source, DEFAULT_FPS);
+    }
+
     console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
     let skipped = 0;
@@ -1497,11 +1428,8 @@ async function renderFromProject(req, jobId) {
       const dur = await calculatePanelDuration(p);
       const segPath = path.join(TEMP_ROOT, `seg_${jobId}_${i}.mp4`);
 
-      const cinematic = getPanelCinematic(p, renderOptions, projectDir);
       const perPanelOpts = {
         ...renderOptions,
-        motion: cinematic.motion,
-        cinematic,
         zoomFactor: Number(p.zoom || 1),
         focusX:     Number(p.focusX != null ? p.focusX : 0.5),
         focusY:     Number(p.focusY != null ? p.focusY : 0.5)
@@ -1517,11 +1445,25 @@ async function renderFromProject(req, jobId) {
         idx: i,
         panelCount,
         aspectMode: renderOptions.aspectMode,
+        motion: p.motion || p.cameraMotion || perPanelOpts.motion || "",
+        vfxLayers: [
+          ...activeLayers(renderOptions.vfxLayers || [], i + 1),
+          ...parseJsonArray(p.vfxLayers || p.vfx_layers || p.vfx).map(v => typeof v === "string" ? { name: v, file: v, startPanel: i + 1, endPanel: i + 1 } : v)
+        ],
+        sfxLayers: [
+          ...activeLayers(renderOptions.sfxLayers || [], i + 1),
+          ...parseJsonArray(p.sfxLayers || p.sfx_layers || p.sfx).map(v => typeof v === "string" ? { name: v, file: v, startPanel: i + 1, endPanel: i + 1 } : v)
+        ],
         renderOptions: perPanelOpts
       });
 
-      segPaths.push(segPath);
-      durations.push(dur);
+      if (result.success) {
+        segPaths.push(segPath);
+        durations.push(dur);
+      } else {
+        skipped++;
+        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
+      }
 
       const pct = Math.round(((i + 1) / panels.length) * 80);
       updateJob(jobId, { progress: pct, skipped });
@@ -1537,7 +1479,7 @@ async function renderFromProject(req, jobId) {
     updateJob(jobId, { progress: 85 });
 
     const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
-    await concatSegments(segPaths, durations, finalPath, renderOptions);
+    await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
     cleanupFiles(segPaths);
 
     const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
@@ -1563,10 +1505,8 @@ async function renderFromProject(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: renderOptions.fps,
-
+      fps: DEFAULT_FPS,
       aspectMode: renderOptions.aspectMode,
-      resolution: `${renderOptions.width}x${renderOptions.height}`,
       encodingSettings: {
         crf: renderOptions.crf,
         preset: renderOptions.preset,
@@ -1607,7 +1547,6 @@ async function renderFromMultipart(req, jobId) {
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
   const panelCount   = imageFiles.length;
   const renderOptions = extractRenderOptions(req.body);
-  renderOptions.projectDir = path.dirname(imageFiles[0]?.path || UPLOADS_ROOT);
 
   updateJob(jobId, { batchIndex, totalBatches });
 
@@ -1639,8 +1578,13 @@ async function renderFromMultipart(req, jobId) {
         renderOptions
       });
 
-      segPaths.push(segPath);
-      durations.push(dur);
+      if (result.success) {
+        segPaths.push(segPath);
+        durations.push(dur);
+      } else {
+        skipped++;
+        console.warn(`[${jobId}] Panel ${i + 1} skipped (${skipped} total skipped)`);
+      }
 
       const pct = Math.round(((i + 1) / imageFiles.length) * 80);
       updateJob(jobId, { progress: pct, skipped });
@@ -1656,7 +1600,7 @@ async function renderFromMultipart(req, jobId) {
     updateJob(jobId, { progress: 85 });
 
     const finalPath = path.join(OUTPUT_ROOT, `${jobId}_final.mp4`);
-    await concatSegments(segPaths, durations, finalPath, renderOptions);
+    await concatWithTransitions(segPaths, durations, finalPath, renderOptions);
     cleanupFiles([...segPaths, ...uploadPaths]);
 
     const host = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || req.get("host")}`;
@@ -1681,10 +1625,8 @@ async function renderFromMultipart(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: renderOptions.fps,
-
+      fps: DEFAULT_FPS,
       aspectMode: renderOptions.aspectMode,
-      resolution: `${renderOptions.width}x${renderOptions.height}`,
       encodingSettings: {
         crf: renderOptions.crf,
         preset: renderOptions.preset,
@@ -1722,26 +1664,20 @@ app.use((req, res) => {
 setInterval(() => {
   const now = Date.now();
 
-  const removeOld = (dir) => {
-    if (!fs.existsSync(dir)) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      try {
-        const stat = fs.statSync(full);
-        if (entry.isDirectory()) {
-          removeOld(full);
-          if (fs.readdirSync(full).length === 0 && now - stat.mtimeMs > 2 * 60 * 60 * 1000) {
-            fs.rmdirSync(full);
+  [OUTPUT_ROOT, TEMP_ROOT].forEach((dir) => {
+    try {
+      fs.readdirSync(dir).forEach((file) => {
+        const full = path.join(dir, file);
+        try {
+          const stat = fs.statSync(full);
+          if (now - stat.mtimeMs > 2 * 60 * 60 * 1000) {
+            fs.unlinkSync(full);
+            console.log(`[cleanup] Deleted old file: ${file}`);
           }
-        } else if (now - stat.mtimeMs > 2 * 60 * 60 * 1000) {
-          fs.unlinkSync(full);
-          console.log(`[cleanup] Deleted old file: ${full}`);
-        }
-      } catch (_) {}
-    }
-  };
-  removeOld(OUTPUT_ROOT);
-  removeOld(TEMP_ROOT);
+        } catch (_) {}
+      });
+    } catch (_) {}
+  });
 }, 30 * 60 * 1000);
 
 // ================================
@@ -1752,7 +1688,6 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`ScriptReel running on port ${PORT}`);
   console.log(`Renderer: ${RENDERER_NAME}`);
   console.log(`FFmpeg: ${FFMPEG_PATH}`);
-  console.log(`Default render: 1280x720 @ 20fps; FFmpeg threads=${process.env.FFMPEG_THREADS || 2}`);
 });
 
 // FIX #4: Add Upload Timeout Safety

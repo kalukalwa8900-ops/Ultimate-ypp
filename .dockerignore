@@ -1,8 +1,7 @@
 node_modules
-npm-debug.log
-uploads/*
-output/*
-temp/*
 .git
-.gitignore
-*.zip
+uploads
+output
+temp
+vfx-library/cache
+*.log
