@@ -1,5 +1,5 @@
-node_modules
-render-data
+node_modules/
+uploads/
+output/
+temp/
 *.log
-.DS_Store
-.env
