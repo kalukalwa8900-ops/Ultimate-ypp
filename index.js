@@ -62,8 +62,8 @@ console.log(`✓ FFprobe Path: ${FFPROBE_PATH}`);
 app.use(cors());
 
 // FIX #2: Increase Request Limits
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(express.json({ limit: "2gb" }));
+app.use(express.urlencoded({ extended: true, limit: "2gb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/output", express.static(path.join(__dirname, "output")));
 
@@ -88,7 +88,7 @@ const UPLOADS_ROOT = path.join(__dirname, "uploads");
 const OUTPUT_ROOT  = path.join(__dirname, "output");
 const TEMP_ROOT    = path.join(__dirname, "temp");
 
-[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT, path.join(__dirname, "vfx-library"), path.join(__dirname, "sfx-library")].forEach((dir) => {
+[UPLOADS_ROOT, OUTPUT_ROOT, TEMP_ROOT].forEach((dir) => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -249,7 +249,7 @@ function getImageDimensions(imagePath) {
 // ================================
 
 async function calculatePanelDuration(panel) {
-  const PADDING = 0;
+  const PADDING = 0.2;
 
   // Priority 1: ZIP MP3 audio (actual duration)
   if (panel.audio && panel.audio_source === "zip") {
@@ -371,18 +371,12 @@ const zipUpload = multer({
 });
 
 // ================================
-// Render constants — Railway Free safe defaults
+// FPS: Fixed at 25 — smooth motion, hard-encoded output framerate
 // ================================
-const OUTPUT_WIDTH = 1280;
-const OUTPUT_HEIGHT = 720;
-const DEFAULT_FPS = 20;
-const VIDEO_THREADS = 2;
-const FILTER_THREADS = 1;
-const DEFAULT_VFX_OPACITY = 0.60;
-const DEFAULT_SFX_VOLUME = 0.08;
 
-function getFps(_panelCount) {
-  return DEFAULT_FPS;
+function getFps(panelCount) {
+  // 25fps hard-encoded output
+  return 25;
 }
 
 // ================================
@@ -411,55 +405,52 @@ function calculateFitInFrame(imageAspectRatio, frameWidth = 1280, frameHeight = 
 }
 
 // ================================
-// Ken Burns — 720p / 20 FPS / low-memory
+// Ken Burns Animation — zoom in / zoom out ONLY (no pans/slides)
+// 25fps · scale=2560 · zoom=1.18
 // ================================
-function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit", motion = "") {
-  const fps = DEFAULT_FPS;
-  const totalFrames = Math.max(1, Math.ceil(duration * fps));
+
+function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
+  const fps = 25; // Always 25fps
+  const totalFrames = Math.ceil(duration * fps);
   const normalised = String(aspectMode || "fit").toLowerCase().trim();
-  const requested = String(motion || "").toLowerCase().trim();
 
-  // Stable mapping so frontend can send simple words.
-  let motionIndex = idx % 6;
-  const map = {
-    "static": -1, "none": -1,
-    "zoom in": 0, "zoom_in": 0, "zoomin": 0,
-    "zoom out": 1, "zoom_out": 1, "zoomout": 1,
-    "slide left": 2, "slide_left": 2,
-    "slide right": 3, "slide_right": 3,
-    "slide up": 4, "slide_up": 4,
-    "slide down": 5, "slide_down": 5
-  };
-  if (Object.prototype.hasOwnProperty.call(map, requested)) motionIndex = map[requested];
-  if (motionIndex < 0) {
-    return `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
+  if (normalised === "fit") {
+    // FIT MODE — full image visible, letterbox/pillarbox, zoom in/out only
+    const animations = [
+      // 1. Zoom IN (100% → 118%)
+      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 2. Zoom OUT (118% → 100%)
+      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+    ];
+    return animations[idx % animations.length];
+
+  } else if (normalised === "cinematic") {
+    // CINEMATIC MODE — fill full frame, zoom in/out only
+    const animations = [
+      // 1. Zoom IN center
+      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      // 2. Zoom OUT center
+      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+    ];
+    return animations[idx % animations.length];
   }
-
-  // Only ~1.25x working canvas instead of 2560px/4K intermediates.
-  const workW = 1600;
-  const fpsPart = `fps=${fps}`;
-  const out = `${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}`;
 
   if (normalised === "blurpad" || normalised === "blur-pad" || normalised === "blur_pad") {
-    // Keep blur-pad available, but use a modest blur to protect RAM.
-    const base = `split[bg][fg];[bg]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},gblur=sigma=12[bg2]`;
-    const fg = motionIndex === 0
-      ? `[fg]scale=${workW}:-1,zoompan=z='min(zoom+0.0007,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg2]`
-      : motionIndex === 1
-      ? `[fg]scale=${workW}:-1,zoompan=z='if(lte(on,1),1.12,max(zoom-0.0007,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg2]`
-      : `[fg]scale=${workW}:-1,zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fg2]`;
-    return `${base};${fg};[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`;
+    // BLUR-PAD MODE — original image centred at native ratio over a heavily
+    // blurred, scaled copy of itself. No distortion, no black bars.
+    // Ken Burns is applied to the foreground only; the blurred bg is static.
+    // Zoom in/out only.
+    const animations = [
+      // 1. Zoom IN foreground
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      // 2. Zoom OUT foreground
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+    ];
+    return animations[idx % animations.length];
   }
 
-  const animations = [
-    `scale=${workW}:-1,zoompan=z='min(zoom+0.0007,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-    `scale=${workW}:-1,zoompan=z='if(lte(on,1),1.12,max(zoom-0.0007,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-    `scale=${workW}:-1,zoompan=z='1.10':x='if(lte(on,1),iw*0.10,min(x+iw*0.06/${totalFrames},iw*0.16))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-    `scale=${workW}:-1,zoompan=z='1.10':x='if(lte(on,1),iw*0.16,max(x-iw*0.06/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-    `scale=${workW}:-1,zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,min(y+ih*0.06/${totalFrames},ih*0.14))':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
-    `scale=${workW}:-1,zoompan=z='1.10':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.14,max(y-ih*0.06/${totalFrames},ih*0.08))':d=${totalFrames}:s=${out}:fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`
-  ];
-  return animations[motionIndex];
+  // Default: static fit (fastest, no animation)
+  return `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`;
 }
 
 // ================================
@@ -507,214 +498,158 @@ function buildVideoFilterChain(options = {}, baseFilter = "") {
 }
 
 // ================================
-// VFX/SFX helpers
+// Create Segment (MP4) - OPTIMIZED for quality & speed
 // ================================
-function parseJsonArray(value) {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== "string" || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
-    return [];
-  }
-}
 
-function resolveAssetPath(asset, kind = "vfx", projectDir = null) {
-  if (!asset) return null;
-  const raw = typeof asset === "string" ? asset : (asset.path || asset.file || asset.assetPath || asset.localPath || asset.name || "");
-  if (!raw) return null;
-
-  const candidates = [];
-  if (path.isAbsolute(raw)) candidates.push(raw);
-  else {
-    if (projectDir) candidates.push(path.join(projectDir, raw));
-    candidates.push(path.join(UPLOADS_ROOT, raw));
-    candidates.push(path.join(__dirname, kind === "vfx" ? "vfx-library" : "sfx-library", raw));
-    candidates.push(path.join(TEMP_ROOT, raw));
-    candidates.push(raw);
-  }
-  return candidates.find(p => fs.existsSync(p)) || null;
-}
-
-function layerRange(layer) {
-  const start = Number(layer.startPanel ?? layer.start ?? layer.from ?? layer.panelStart ?? layer.panel ?? 1);
-  const end = Number(layer.endPanel ?? layer.end ?? layer.to ?? layer.panelEnd ?? start);
-  return {
-    start: Math.max(1, Math.floor(start || 1)),
-    end: Math.max(1, Math.floor(end || start || 1))
-  };
-}
-
-function activeLayers(layers, panelNumber) {
-  return layers.filter(layer => {
-    if (!layer || layer.enabled === false || layer.enabled === "false") return false;
-    const r = layerRange(layer);
-    return panelNumber >= r.start && panelNumber <= r.end;
-  });
-}
-
-async function prepareVfxAsset(inputPath, fps = DEFAULT_FPS) {
-  if (!inputPath || !fs.existsSync(inputPath)) {
-    throw new Error(`VFX asset not found: ${inputPath || "empty"}`);
-  }
-
-  const stat = fs.statSync(inputPath);
-  const key = crypto.createHash("sha1")
-    .update(`${inputPath}|${stat.size}|${stat.mtimeMs}|${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}|${fps}`)
-    .digest("hex");
-  const cacheDir = path.join(__dirname, "vfx-library", "cache");
-  fs.mkdirSync(cacheDir, { recursive: true });
-
-  const outPath = path.join(cacheDir, `${key}.webm`);
-  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) return outPath;
-
-  const ext = path.extname(inputPath).toLowerCase();
-  const isImage = [".png", ".jpg", ".jpeg", ".webp"].includes(ext);
-  const args = ["-hide_banner", "-loglevel", "error"];
-
-  if (isImage) {
-    args.push("-loop", "1", "-framerate", String(fps), "-i", inputPath, "-t", "5");
-  } else {
-    args.push("-i", inputPath);
-  }
-
-  args.push(
-    "-vf", `fps=${fps},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=yuva420p`,
-    "-an",
-    "-c:v", "libvpx-vp9",
-    "-b:v", "800k",
-    "-deadline", "realtime",
-    "-cpu-used", "5",
-    "-auto-alt-ref", "0",
-    "-threads", String(VIDEO_THREADS),
-    "-y", outPath
-  );
-
-  console.log(`[vfx] preparing ${path.basename(inputPath)} → 720p/${fps}fps`);
-  await spawnFfmpeg(args, `prepare VFX ${path.basename(inputPath)}`);
-  return outPath;
-}
-
-// ================================
-// Create Segment — 720p / 20 FPS / Ken Burns + optional VFX/SFX
-// ================================
-async function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, motion: motionName, vfxLayers = [], sfxLayers = [], renderOptions = {} }) {
-  const fps = DEFAULT_FPS;
-  const panelNumber = idx + 1;
-
-  // VFX is normalized once and reused from cache.
-  const preparedVfx = [];
-  for (const layer of vfxLayers) {
-    const source = resolveAssetPath(layer, "vfx", renderOptions.projectDir);
-    if (!source) throw new Error(`Panel ${panelNumber}: VFX asset not found: ${layer?.name || layer?.file || layer?.path || "unknown"}`);
-    const prepared = await prepareVfxAsset(source, fps);
-    preparedVfx.push({ layer, path: prepared });
-  }
-
-  const preparedSfx = [];
-  for (const layer of sfxLayers) {
-    const source = resolveAssetPath(layer, "sfx", renderOptions.projectDir);
-    if (!source) throw new Error(`Panel ${panelNumber}: SFX asset not found: ${layer?.name || layer?.file || layer?.path || "unknown"}`);
-    preparedSfx.push({ layer, path: source });
-  }
-
-  const motion = renderOptions.motion || motionName || "";
-  const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode, motion);
-  const hasAudio = audioPath && fs.existsSync(audioPath);
-
-  const cmd = ffmpeg()
-    .setFfmpegPath(FFMPEG_PATH)
-    .input(imagePath)
-    .inputOptions(["-loop", "1", "-framerate", String(fps)]);
-
-  if (hasAudio) {
-    cmd.input(audioPath);
-  } else {
-    cmd.input(`aevalsrc=0:channel_layout=stereo:sample_rate=48000:duration=${duration}`)
-      .inputOptions(["-f", "lavfi"]);
-  }
-
-  // Every VFX/SFX is a reusable range layer. The same asset can span many panels.
-  for (const v of preparedVfx) {
-    cmd.input(v.path).inputOptions(["-stream_loop", "-1"]);
-  }
-  for (const a of preparedSfx) {
-    cmd.input(a.path).inputOptions(["-stream_loop", "-1"]);
-  }
-
-  const filter = [];
-  filter.push(`[0:v]${kenBurns}[base]`);
-  let current = "base";
-
-  // VFX compositing. Opacity is applied per layer and defaults to 60%.
-  preparedVfx.forEach((v, n) => {
-    const inputIndex = 2 + n;
-    const opacity = Math.max(0.05, Math.min(1, Number(v.layer.opacity ?? DEFAULT_VFX_OPACITY)));
-    const label = `v${n}`;
-    filter.push(`[${inputIndex}:v]fps=${fps},setpts=PTS-STARTPTS,format=rgba,colorchannelmixer=aa=${opacity}[${label}]`);
-    filter.push(`[${current}][${label}]overlay=0:0:shortest=0:format=auto[ov${n}]`);
-    current = `ov${n}`;
-  });
-  filter.push(`[${current}]format=yuv420p[outv]`);
-
-  // SFX are mixed quietly under narration. Each active layer loops for the panel duration.
-  const audioInputStart = 2 + preparedVfx.length;
-  const audioLabels = ["[1:a]aresample=48000,asetpts=PTS-STARTPTS[narr]"];
-  preparedSfx.forEach((a, n) => {
-    const inputIndex = audioInputStart + n;
-    const volume = Math.max(0, Math.min(0.08, Number(a.layer.volume ?? a.layer.gain ?? DEFAULT_SFX_VOLUME)));
-    audioLabels.push(`[${inputIndex}:a]aresample=48000,asetpts=PTS-STARTPTS,volume=${volume.toFixed(4)},atrim=duration=${duration.toFixed(3)}[s${n}]`);
-  });
-  if (preparedSfx.length) {
-    filter.push(...audioLabels);
-    filter.push(`[narr]${preparedSfx.map((_, n) => `[s${n}]`).join("")}amix=inputs=${preparedSfx.length + 1}:duration=first:dropout_transition=0:normalize=0[aout]`);
-  } else {
-    filter.push("[1:a]aresample=48000,asetpts=PTS-STARTPTS[aout]");
-  }
-
-  const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  console.log(`[${RENDERER_NAME}][seg${idx}] START panel=${panelNumber} dur=${duration.toFixed(2)}s VFX=${preparedVfx.length} SFX=${preparedSfx.length} mem=${memMB}MB`);
-
-  const outputOpts = [
-    "-filter_complex", filter.join(";"),
-    "-map", "[outv]",
-    "-map", "[aout]",
-    "-c:v", "libx264",
-    "-pix_fmt", "yuv420p",
-    "-r", String(fps),
-    "-g", String(fps * 2),
-    "-crf", "21",
-    "-preset", "veryfast",
-    "-threads", String(VIDEO_THREADS),
-    "-filter_threads", String(FILTER_THREADS),
-    "-filter_complex_threads", String(FILTER_THREADS),
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-shortest",
-    "-t", String(duration),
-    "-movflags", "+faststart",
-    "-y"
-  ];
-
+function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
   return new Promise((resolve, reject) => {
-    cmd.outputOptions(outputOpts).output(outPath)
-      .on("start", command => console.log(`[seg${idx}] ${command}`))
+    const FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+    const wrapped = wrapText(text);
+    const kenBurns = getKenBurnsFilter(idx, duration, panelCount, aspectMode);
+
+    const vfParts = [
+      buildVideoFilterChain(renderOptions, kenBurns),
+      "setsar=1"
+    ];
+
+    const hasAudio = audioPath && fs.existsSync(audioPath);
+    const overlayPath = renderOptions.overlayPath && fs.existsSync(renderOptions.overlayPath)
+      ? renderOptions.overlayPath : null;
+    const overlayMeta = renderOptions.overlay || null;
+
+    const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+    console.log(`[${RENDERER_NAME}][seg${idx}] START — jobId=${jobId} mode=${aspectMode} dur=${duration}s panelCount=${panelCount} mem=${memMB}MB`);
+
+    const cmd = ffmpeg()
+      .setFfmpegPath(FFMPEG_PATH)
+      .input(imagePath)
+      .inputOptions(["-loop 1", "-framerate 25"]);
+
+    if (hasAudio) {
+      cmd.input(audioPath);
+    } else {
+      cmd
+        .input(`aevalsrc=0:channel_layout=stereo:sample_rate=44100:duration=${duration}`)
+        .inputOptions(["-f lavfi"]);
+    }
+
+    // Optional channel branding overlay (PNG with alpha)
+    if (overlayPath) {
+      cmd.input(overlayPath);
+    }
+
+    // Speed-optimised quality settings
+    const videoCodec   = renderOptions.videoCodec  || "libx264";
+    const pixFmt       = renderOptions.pixFmt       || "yuv420p";
+    const crf          = Math.max(18, Math.min(26, parseInt(renderOptions.crf) || 21)); // CRF 21
+    const preset       = renderOptions.preset        || "faster"; // faster > medium for speed
+    const maxrate      = renderOptions.maxrate        || "";
+    const bufsize      = renderOptions.bufsize        || "";
+    const audioBitrate = renderOptions.audioBitrate   || "192k";
+    const movflags     = renderOptions.movflags ? String(renderOptions.movflags) : "+faststart";
+
+    // No loudnorm — removed for speed; audio passed through clean
+    // Build the video filter pipeline. If an overlay is attached, switch
+    // from -vf to -filter_complex so we can composite the watermark.
+    let videoFilterFlag = ["-vf", vfParts.join(",")];
+    if (overlayPath) {
+      const pos = overlayMeta?.position || "top-right";
+      const sizePct = Math.max(3, Math.min(40, Number(overlayMeta?.sizePct ?? 12)));
+      const margin  = Math.max(0, Math.min(200, Number(overlayMeta?.marginPx ?? 16)));
+      const opacity = Math.max(0.05, Math.min(1, Number(overlayMeta?.opacity ?? 1)));
+      const wmW = Math.round(1280 * sizePct / 100);
+
+      let xExpr, yExpr;
+      if (pos === "top-left")          { xExpr = String(margin);                 yExpr = String(margin); }
+      else if (pos === "bottom-left")  { xExpr = String(margin);                 yExpr = `H-h-${margin}`; }
+      else if (pos === "bottom-right") { xExpr = `W-w-${margin}`;              yExpr = `H-h-${margin}`; }
+      else                              { xExpr = `W-w-${margin}`;              yExpr = String(margin); }
+
+      const complex =
+        `[0:v]${vfParts.join(",")}[bgv];` +
+        `[2:v]scale=${wmW}:-1,format=rgba,colorchannelmixer=aa=${opacity}[wm];` +
+        `[bgv][wm]overlay=${xExpr}:${yExpr}:format=auto[outv]`;
+      videoFilterFlag = ["-filter_complex", complex, "-map", "[outv]", "-map", "1:a?"];
+    }
+
+    const outputOpts = [
+      ...videoFilterFlag,
+      `-c:v ${videoCodec}`,
+      `-pix_fmt ${pixFmt}`,
+      `-r 25`,           // ← 25 fps output (hard-encoded)
+      `-g 50`,           // ← GOP = 2× fps for clean seeking
+      `-crf ${crf}`,
+      `-preset ${preset}`,
+      `-threads 0`,      // ← Let FFmpeg use all available CPU cores
+      `-movflags ${movflags}`,
+      `-c:a aac`,
+      `-b:a ${audioBitrate}`,
+      "-shortest",
+      `-t ${duration}`
+    ];
+
+    // Add bitrate control if specified
+    if (maxrate) outputOpts.splice(-3, 0, `-maxrate ${maxrate}`);
+    if (bufsize)  outputOpts.splice(-3, 0, `-bufsize ${bufsize}`);
+
+    cmd
+      .outputOptions(outputOpts)
+      .output(outPath)
+      .on("start", () => {
+        console.log(`[seg${idx}] FFmpeg encoding started`);
+      })
+      .on("progress", () => {
+        // suppress per-frame logs
+      })
       .on("end", () => {
-        const memAfter = Math.round(process.memoryUsage().rss / 1024 / 1024);
-        console.log(`[${RENDERER_NAME}][seg${idx}] END mem=${memAfter}MB`);
+        const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+        console.log(`[seg${idx}] END — mem=${memMB}MB`);
         resolve();
       })
-      .on("error", err => reject(new Error(`Panel ${panelNumber} FFmpeg failed: ${err.message}`)))
+      .on("error", (err) => {
+        const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+        const isOOM = err.message.includes("Cannot allocate memory") ||
+                      err.message.includes("Out of memory") ||
+                      err.message.includes("ENOMEM") ||
+                      err.message.includes("killed");
+        if (isOOM) {
+          console.error(`[seg${idx}] ❌ OOM CRASH — mem=${memMB}MB — ${err.message}`);
+        } else {
+          console.error(`[seg${idx}] ❌ ERROR — mem=${memMB}MB — ${err.message}`);
+        }
+        reject(err);
+      })
       .run();
   });
 }
 
-async function createSegmentSafe(opts) {
-  // Do not silently skip panels. One failed panel must fail the job so the final
-  // video never silently loses narration/images.
-  await createSegment(opts);
-  return { success: true };
+// ================================
+// createSegment with retry + skip on failure
+// ================================
+
+async function createSegmentSafe({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions = {} }) {
+  const MAX_RETRIES = 2;
+  let lastErr;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await createSegment({ imagePath, audioPath, text, duration, outPath, jobId, idx, panelCount, aspectMode, renderOptions });
+      return { success: true };
+    } catch (err) {
+      lastErr = err;
+      const isOOM = err.message.includes("Cannot allocate memory") ||
+                    err.message.includes("Out of memory") ||
+                    err.message.includes("ENOMEM") ||
+                    err.message.includes("killed");
+      console.warn(`[seg${idx}] attempt ${attempt}/${MAX_RETRIES} failed${isOOM ? " (OOM)" : ""}: ${err.message.split("\n")[0]}`);
+      if (isOOM) {
+        await new Promise(r => setTimeout(r, 3000 * attempt));
+      }
+    }
+  }
+
+  console.error(`[seg${idx}] ❌ ALL RETRIES FAILED — skipping panel. Last error: ${lastErr.message.split("\n")[0]}`);
+  return { success: false, error: lastErr.message };
 }
 
 // ================================
@@ -766,7 +701,7 @@ function spawnFfmpeg(args, description = "") {
 
 // ================================
 // CONCAT — Lossless stream-copy (no re-render, no quality loss, instant)
-// Segments already encoded at 15fps/CRF-21; just join them.
+// Segments already encoded at 25fps/CRF-21; just join them.
 // ================================
 
 async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
@@ -868,24 +803,7 @@ app.get("/health", (req, res) => {
     status: "ok",
     renderer: RENDERER_NAME,
     memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    queueLength: renderQueue.length,
-    renderBusy,
     timestamp: new Date().toISOString()
-  });
-});
-
-
-app.get("/render-config", (_req, res) => {
-  res.json({
-    success: true,
-    width: OUTPUT_WIDTH,
-    height: OUTPUT_HEIGHT,
-    fps: DEFAULT_FPS,
-    videoThreads: VIDEO_THREADS,
-    filterThreads: FILTER_THREADS,
-    vfxOpacityDefault: DEFAULT_VFX_OPACITY,
-    sfxVolumeDefault: DEFAULT_SFX_VOLUME,
-    transitions: false
   });
 });
 
@@ -907,60 +825,48 @@ app.get("/status/:jobId", (req, res) => {
 
 app.post(
   "/panel",
-  // Accept the frontend's file field names without Multer rejecting a valid image/audio.
-  // The route still enforces a maximum of 4 uploaded files.
-  panelUpload.any(),
+  panelUpload.fields([
+    { name: "image", maxCount: 1 },
+    { name: "audio", maxCount: 1 }
+  ]),
   (req, res) => {
     try {
       const projectId = safeName(req.body.project_id || req.body.projectId, "project");
       const panelId   = safeName(req.body.panel_id || req.body.panelId || `panel_${Date.now()}`, "panel");
       const duration  = Number(req.body.duration || 4);
       const narration = String(req.body.narration || "").trim();
-      const uploaded = Array.isArray(req.files) ? req.files : [];
 
-      const isImage = (f) => /^image\//i.test(f.mimetype || "") ||
-        /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.originalname || "");
-      const isAudio = (f) => /^audio\//i.test(f.mimetype || "") ||
-        /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(f.originalname || "");
-
-      // Prefer conventional field names, then fall back to MIME/extension.
-      const imageFile =
-        uploaded.find(f => /^(image|images|imageFile|panelImage)$/i.test(f.fieldname) && isImage(f)) ||
-        uploaded.find(isImage);
-
-      const audioFile =
-        uploaded.find(f => /^(audio|audioFile|narration|mp3)$/i.test(f.fieldname) && isAudio(f)) ||
-        uploaded.find(isAudio);
-
-      if (!imageFile) {
-        cleanupFiles(uploaded.map(f => f.path));
-        return res.status(400).json({
-          success: false,
-          error: "Image required. Accepted image upload field names are flexible."
-        });
+      if (!req.files?.image || !req.files.image[0]) {
+        return res.status(400).json({ success: false, error: "Image required" });
       }
 
       const projectDir = path.join(UPLOADS_ROOT, projectId);
       const panelDir   = path.join(projectDir, panelId);
+
       [projectDir, panelDir].forEach((dir) => {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       });
 
-      // Keep the existing renderer contract: image.jpg.
-      // The upload is already on disk; copy it and remove the temporary upload.
-      const imagePath = path.join(panelDir, "image.jpg");
-      fs.copyFileSync(imageFile.path, imagePath);
+      // FIX #1: Read from disk instead of buffer
+      const imageBuffer = fs.readFileSync(req.files.image[0].path);
+      const imagePath = path.join(panelDir, `image.jpg`);
+      fs.writeFileSync(imagePath, imageBuffer);
+      fs.unlinkSync(req.files.image[0].path); // Clean up temp file
 
+      let audioPath = null;
       let audioFileName = null;
-      if (audioFile) {
-        audioFileName = `audio${extFor(audioFile, ".mp3")}`;
-        fs.copyFileSync(audioFile.path, path.join(panelDir, audioFileName));
+      if (req.files?.audio && req.files.audio[0]) {
+        const audioExt = extFor(req.files.audio[0], ".mp3");
+        audioFileName = `audio${audioExt}`;
+        audioPath = path.join(panelDir, audioFileName);
+        const audioBuffer = fs.readFileSync(req.files.audio[0].path);
+        fs.writeFileSync(audioPath, audioBuffer);
+        fs.unlinkSync(req.files.audio[0].path); // Clean up temp file
       }
 
-      // Clean every temporary upload, including any unexpected extra files.
-      cleanupFiles(uploaded.map(f => f.path));
-
       const index = Number(req.body.index || 0);
+
+      // Per-panel manual zoom/crop (frontend sends 0-100 % focus or 0-1)
       const zoomVal = Math.max(1, Math.min(3, Number(req.body.zoom || req.body.zoomFactor || 1)));
       const rawFX = Number(req.body.focusX != null ? req.body.focusX : req.body.cropX);
       const rawFY = Number(req.body.focusY != null ? req.body.focusY : req.body.cropY);
@@ -970,22 +876,28 @@ app.post(
       fs.writeFileSync(
         path.join(panelDir, "metadata.json"),
         JSON.stringify({
-          index, duration, narration,
-          image: "image.jpg",
-          audio: audioFileName,
-          zoom: zoomVal, focusX, focusY,
+          index,
+          duration,
+          narration,
+          image:       "image.jpg",
+          audio:       audioFileName,
+          zoom:        zoomVal,
+          focusX,
+          focusY,
           uploaded_at: new Date().toISOString()
         }, null, 2)
       );
 
       console.log(`[panel] saved ${projectId}/${panelId}`);
+
       return res.json({
-        success: true,
-        panel: panelId,
-        panel_id: panelId,
-        ref: panelId,
+        success:    true,
+        panel:      panelId,
+        panel_id:   panelId,
+        ref:        panelId,
         project_id: projectId
       });
+
     } catch (err) {
       console.error("/panel error:", err);
       return res.status(500).json({ success: false, error: err.message });
@@ -997,20 +909,15 @@ app.post(
 // AUDIO ZIP UPLOAD ROUTE
 // ================================
 
-app.post("/audio-zip", zipUpload.any(), async (req, res) => {
+app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
   try {
-    const uploaded = Array.isArray(req.files) ? req.files : [];
-    const zipFile = uploaded.find(f =>
-      /zip/i.test(f.mimetype || "") || /\.zip$/i.test(f.originalname || "")
-    );
-    const fileForRoute = zipFile || uploaded[0];
     const projectId = safeName(req.body.project_id || req.body.projectId, "");
     if (!projectId) {
       return res.status(400).json({ success: false, error: "Missing project_id" });
     }
 
-    if (!fileForRoute) {
-      return res.status(400).json({ success: false, error: "Audio ZIP file required" });
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: "audioZip file required" });
     }
 
     const projectDir = path.join(UPLOADS_ROOT, projectId);
@@ -1019,9 +926,9 @@ app.post("/audio-zip", zipUpload.any(), async (req, res) => {
     }
 
     // FIX #1: Read from disk instead of memory buffer
-    const zipBuffer = fs.readFileSync(fileForRoute.path);
+    const zipBuffer = fs.readFileSync(req.file.path);
     const zip = new AdmZip(zipBuffer);
-    cleanupFiles(uploaded.map(f => f.path)); // Clean up all temporary uploads
+    fs.unlinkSync(req.file.path); // Clean up temp file
     
     const entries = zip.getEntries();
 
@@ -1111,95 +1018,6 @@ app.post("/audio-zip", zipUpload.any(), async (req, res) => {
   }
 });
 
-
-// ================================
-// Railway Free safety: one render job at a time
-// ================================
-const renderQueue = [];
-let renderBusy = false;
-
-function enqueueRender(fn) {
-  renderQueue.push(fn);
-  processRenderQueue();
-}
-
-async function processRenderQueue() {
-  if (renderBusy || !renderQueue.length) return;
-  renderBusy = true;
-  const next = renderQueue.shift();
-  try {
-    await next();
-  } catch (err) {
-    console.error("[queue] render task failed:", err.message);
-  } finally {
-    renderBusy = false;
-    setImmediate(processRenderQueue);
-  }
-}
-
-
-// ================================
-// VFX / SFX local libraries
-// ================================
-const vfxLibraryStorage = multer.diskStorage({
-  destination: path.join(__dirname, "vfx-library"),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || ".webm";
-    const base = safeName(path.basename(file.originalname, path.extname(file.originalname)), "vfx");
-    cb(null, `${base}_${Date.now()}${ext}`);
-  }
-});
-const sfxLibraryStorage = multer.diskStorage({
-  destination: path.join(__dirname, "sfx-library"),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || ".mp3";
-    const base = safeName(path.basename(file.originalname, path.extname(file.originalname)), "sfx");
-    cb(null, `${base}_${Date.now()}${ext}`);
-  }
-});
-
-const vfxLibraryUpload = multer({
-  storage: vfxLibraryStorage,
-  limits: { fileSize: 100 * 1024 * 1024, files: 1 }
-});
-const sfxLibraryUpload = multer({
-  storage: sfxLibraryStorage,
-  limits: { fileSize: 50 * 1024 * 1024, files: 1 }
-});
-
-function listLibrary(dir, kind) {
-  fs.mkdirSync(dir, { recursive: true });
-  return fs.readdirSync(dir, { withFileTypes: true })
-    .filter(e => e.isFile())
-    .filter(e => !e.name.startsWith("."))
-    .filter(e => kind === "vfx"
-      ? /\.(webm|mp4|mov|mkv|png|webp|jpg|jpeg)$/i.test(e.name)
-      : /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(e.name))
-    .map(e => ({
-      name: e.name,
-      path: path.join(dir, e.name),
-      size: fs.statSync(path.join(dir, e.name)).size
-    }));
-}
-
-app.get("/library/vfx", (_req, res) => {
-  res.json({ success: true, items: listLibrary(path.join(__dirname, "vfx-library"), "vfx") });
-});
-
-app.get("/library/sfx", (_req, res) => {
-  res.json({ success: true, items: listLibrary(path.join(__dirname, "sfx-library"), "sfx") });
-});
-
-app.post("/library/vfx", vfxLibraryUpload.single("file"), (req, res) => {
-  if (!req.file) return res.status(400).json({ success: false, error: "VFX file required" });
-  res.json({ success: true, name: req.file.filename, path: req.file.path });
-});
-
-app.post("/library/sfx", sfxLibraryUpload.single("file"), (req, res) => {
-  if (!req.file) return res.status(400).json({ success: false, error: "SFX file required" });
-  res.json({ success: true, name: req.file.filename, path: req.file.path });
-});
-
 // ================================
 // RENDER ROUTE (async background job)
 // ================================
@@ -1238,41 +1056,35 @@ function handleRender(req, res) {
     const jobId = createJob();
     res.json({ success: true, jobId, status: "queued" });
 
-    enqueueRender(async () => {
-      await renderFromProject(req, jobId);
+    setImmediate(() => {
+      renderFromProject(req, jobId).catch((err) => {
+        console.error(`[${jobId}] Unhandled project render error:`, err.message);
+        updateJob(jobId, { status: "error", error: err.message });
+        scheduleJobEviction(jobId);
+      });
     });
     return;
   }
 
-  // Images-only multipart request. If the outer /render middleware already
-  // parsed the files, normalize them to the shape expected by renderFromMultipart.
-  const continueWithImages = () => {
-    const jobId = createJob();
-    res.json({ success: true, jobId, status: "queued" });
-    enqueueRender(async () => {
-      await renderFromMultipart(req, jobId);
-    });
-  };
-
-  if (Array.isArray(req._multipartImages) && req._multipartImages.length) {
-    req.files = { images: req._multipartImages };
-    return continueWithImages();
-  }
-
-  // Fallback for non-multipart callers that enter this path with a multipart
-  // body handled by an older client.
-  diskUpload.any()(req, res, (multerErr) => {
+  // Images only — watermark/overlay removed for stability
+  diskUpload.fields([
+    { name: "images", maxCount: 2000 }
+  ])(req, res, (multerErr) => {
     if (multerErr) {
       console.error("[/render] Multer error:", multerErr.message);
       return res.status(400).json({ success: false, error: multerErr.message });
     }
-    const files = Array.isArray(req.files) ? req.files : [];
-    req.files = {
-      images: files.filter(f =>
-        /^image\//i.test(f.mimetype || "") || /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.originalname || "")
-      )
-    };
-    continueWithImages();
+
+    const jobId = createJob();
+    res.json({ success: true, jobId, status: "queued" });
+
+    setImmediate(() => {
+      renderFromMultipart(req, jobId).catch((err) => {
+        console.error(`[${jobId}] Unhandled multipart render error:`, err.message);
+        updateJob(jobId, { status: "error", error: err.message });
+        scheduleJobEviction(jobId);
+      });
+    });
   });
 }
 
@@ -1282,29 +1094,15 @@ function handleRender(req, res) {
 app.post("/render", (req, res) => {
   const ct = String(req.headers["content-type"] || "");
   if (ct.includes("multipart/form-data")) {
-    // Accept arbitrary multipart field names so frontend additions (cinematic,
-    // VFX/SFX metadata, etc.) do not trigger Multer "Unexpected field".
-    // Only file count/size limits are enforced here.
-    const tolerantUpload = multer({
-      storage: overlayUpload.storage,
-      limits: { fileSize: 20 * 1024 * 1024, files: 20 }
-    }).any();
-
-    tolerantUpload(req, res, (err) => {
+    overlayUpload.fields([
+      { name: "overlay",     maxCount: 1 },
+      { name: "overlayLogo", maxCount: 1 },
+      { name: "watermark",   maxCount: 1 }
+    ])(req, res, (err) => {
       if (err) {
-        console.error("[/render] multipart error:", err.message);
+        console.error("[/render] overlay multer error:", err.message);
         return res.status(400).json({ success: false, error: err.message });
       }
-
-      // Keep the object shape expected by handleRender for overlay lookup.
-      const files = Array.isArray(req.files) ? req.files : [];
-      const overlay = files.find(f => /^(overlay|overlayLogo|watermark)$/i.test(f.fieldname));
-      const images = files.filter(f =>
-        /^image\//i.test(f.mimetype || "") || /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.originalname || "")
-      );
-      req._multipartFiles = files;
-      req.files = overlay ? { overlay: [overlay] } : {};
-      req._multipartImages = images;
       handleRender(req, res);
     });
   } else {
@@ -1317,17 +1115,21 @@ app.post("/render", (req, res) => {
 // ================================
 
 function extractRenderOptions(body) {
+  // Map frontend outputFit -> backend aspectMode
+  //   "cover"    -> "cinematic"  (fills frame; allows crop)
+  //   "contain"  -> "fit"        (letterbox, full image visible)
+  //   "blur-pad" -> "blurpad"    (blurred-scaled bg + full image overlay)
   let aspectMode = String(body.aspectMode || body.aspect_mode || "").toLowerCase();
   if (!aspectMode) {
     const fit = String(body.outputFit || body.output_fit || body.fit || "").toLowerCase();
-    if (fit === "blur-pad" || String(body.padMode || body.pad_mode || "").toLowerCase() === "blur" ||
-        body.blurBackground === true || body.blur_background === true || body.blurBackground === "true" || body.blur_background === "true") {
+    if (fit === "blur-pad" || String(body.padMode || body.pad_mode || "").toLowerCase() === "blur" || body.blurBackground === true || body.blur_background === true || body.blurBackground === "true" || body.blur_background === "true") {
       aspectMode = "blurpad";
     } else if (fit === "contain") aspectMode = "fit";
-    else if (fit === "cover") aspectMode = "cinematic";
+    else if (fit === "cover")    aspectMode = "cinematic";
     else aspectMode = "fit";
   }
 
+  // Overlay/watermark metadata
   let overlay = null;
   try {
     const raw = body.overlay || body.overlayMeta;
@@ -1335,32 +1137,24 @@ function extractRenderOptions(body) {
   } catch (_) { overlay = null; }
   if (overlay && (overlay.enabled === false || overlay.enabled === "false")) overlay = null;
 
-  // Simple range-based cinematic layers. Frontend can send JSON or arrays.
-  const vfxLayers = parseJsonArray(body.vfxLayers || body.vfx_layers || body.vfx);
-  const sfxLayers = parseJsonArray(body.sfxLayers || body.sfx_layers || body.sfx);
-
   return {
-    smoothAudio: false,
-    crf: 21,
-    preset: "veryfast",
-    maxrate: "",
-    bufsize: "",
-    audioBitrate: "128k",
-    movflags: "+faststart",
-    pixFmt: "yuv420p",
-    videoCodec: "libx264",
-    zoom: null,
-    zoomFactor: 1.0,
-    cropX: null,
-    cropY: null,
-    focusX: 0.5,
-    focusY: 0.5,
+    smoothAudio:   body.smoothAudio === true || body.smoothAudio === "true",
+    crf:           body.crf || 21,
+    preset:        body.preset || "faster",
+    maxrate:       body.maxrate || "",
+    bufsize:       body.bufsize || "",
+    audioBitrate:  body.audioBitrate || "192k",
+    movflags:      body.movflags || "+faststart",
+    pixFmt:        body.pixFmt || "yuv420p",
+    videoCodec:    body.videoCodec || "libx264",
+    zoom:          body.zoom || null,
+    zoomFactor:    body.zoomFactor || 1.0,
+    cropX:         body.cropX || null,
+    cropY:         body.cropY || null,
+    focusX:        body.focusX || 0.5,
+    focusY:        body.focusY || 0.5,
     aspectMode,
-    overlay,
-    motion: body.motion || "",
-    vfxLayers,
-    sfxLayers,
-    projectDir: null
+    overlay
   };
 }
 
@@ -1432,7 +1226,6 @@ async function renderFromProject(req, jobId) {
   const totalBatches = Number(req.body.totalBatches || req.body.total_batches || 1);
   const panelCount   = panels.length;
   const renderOptions = extractRenderOptions(req.body);
-  renderOptions.projectDir = projectDir;
   if (req._overlayPath && fs.existsSync(req._overlayPath)) {
     renderOptions.overlayPath = req._overlayPath;
   }
@@ -1445,18 +1238,6 @@ async function renderFromProject(req, jobId) {
   try {
     console.log(`[${RENDERER_NAME}][${jobId}] Starting validation — ${panels.length} panels`);
     await validateRenderPanels(panels);
-
-    // Pre-normalize every global VFX asset once before panel rendering.
-    // The normalized 720p/20fps asset is cached and reused for all matching ranges.
-    const uniqueVfx = new Map();
-    for (const layer of renderOptions.vfxLayers || []) {
-      const source = resolveAssetPath(layer, "vfx", projectDir);
-      if (!source) throw new Error(`VFX asset not found: ${layer?.name || layer?.file || layer?.path || "unknown"}`);
-      uniqueVfx.set(source, layer);
-    }
-    for (const source of uniqueVfx.keys()) {
-      await prepareVfxAsset(source, DEFAULT_FPS);
-    }
 
     console.log(`[${RENDERER_NAME}][${jobId}] Starting render — ${panels.length} panels — batch ${batchIndex + 1}/${totalBatches} — panelCount=${panelCount}`);
 
@@ -1484,15 +1265,6 @@ async function renderFromProject(req, jobId) {
         idx: i,
         panelCount,
         aspectMode: renderOptions.aspectMode,
-        motion: p.motion || p.cameraMotion || perPanelOpts.motion || "",
-        vfxLayers: [
-          ...activeLayers(renderOptions.vfxLayers || [], i + 1),
-          ...parseJsonArray(p.vfxLayers || p.vfx_layers || p.vfx).map(v => typeof v === "string" ? { name: v, file: v, startPanel: i + 1, endPanel: i + 1 } : v)
-        ],
-        sfxLayers: [
-          ...activeLayers(renderOptions.sfxLayers || [], i + 1),
-          ...parseJsonArray(p.sfxLayers || p.sfx_layers || p.sfx).map(v => typeof v === "string" ? { name: v, file: v, startPanel: i + 1, endPanel: i + 1 } : v)
-        ],
         renderOptions: perPanelOpts
       });
 
@@ -1544,7 +1316,7 @@ async function renderFromProject(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: DEFAULT_FPS,
+      fps: 25,
       aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
@@ -1664,7 +1436,7 @@ async function renderFromMultipart(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: DEFAULT_FPS,
+      fps: 25,
       aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
