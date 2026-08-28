@@ -12,6 +12,9 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const RENDERER_NAME = process.env.RENDERER_NAME || "renderer";
 
+// Railway Free: keep the Node process from competing with FFmpeg for memory.
+if (!process.env.NODE_OPTIONS) process.env.NODE_OPTIONS = "--max-old-space-size=512";
+
 // ================================
 // FFmpeg Detection & Validation
 // ================================
@@ -54,6 +57,8 @@ ffmpeg.setFfprobePath(FFPROBE_PATH);
 
 console.log(`✓ FFmpeg Path: ${FFMPEG_PATH}`);
 console.log(`✓ FFprobe Path: ${FFPROBE_PATH}`);
+console.log(`✓ Railway-safe renderer: resolution capped at 1280x720 unless ALLOW_HIGHER_RESOLUTION=1`);
+console.log(`✓ FFmpeg video threads: 2 | filter threads: 1 | concurrent render jobs: 1`);
 
 // ================================
 // Middleware
@@ -276,7 +281,7 @@ function getImageDimensions(imagePath) {
 // ================================
 
 async function calculatePanelDuration(panel) {
-  const PADDING = 0.2;
+  const PADDING = 0;
 
   // Priority 1: ZIP MP3 audio (actual duration)
   if (panel.audio && panel.audio_source === "zip") {
@@ -542,8 +547,23 @@ function parseOutputSettings(body = {}) {
     else if (resolution === "1080p" || resolution === "fullhd" || resolution === "full-hd") { width = 1920; height = 1080; }
   }
   if (!width || !height) { width = 1280; height = 720; }
-  width = Math.max(2, Math.min(3840, Math.round(width)));
-  height = Math.max(2, Math.min(2160, Math.round(height)));
+
+  // Railway-safe default/ceiling. The frontend may change FPS, but the
+  // low-memory renderer must not accidentally receive a 1080p/4K request.
+  // Set ALLOW_HIGHER_RESOLUTION=1 only on a machine with enough RAM.
+  const allowHigher = String(process.env.ALLOW_HIGHER_RESOLUTION || "").toLowerCase() === "1" ||
+                      String(process.env.ALLOW_HIGHER_RESOLUTION || "").toLowerCase() === "true";
+  if (!allowHigher) {
+    const scale = Math.min(1280 / width, 720 / height, 1);
+    width = Math.max(2, Math.round(width * scale));
+    height = Math.max(2, Math.round(height * scale));
+    // Keep the requested aspect ratio while guaranteeing even dimensions.
+    width -= width % 2;
+    height -= height % 2;
+  } else {
+    width = Math.max(2, Math.min(3840, Math.round(width)));
+    height = Math.max(2, Math.min(2160, Math.round(height)));
+  }
   const fps = getFps(body.fps || body.frameRate || body.frame_rate || 20);
   return { width, height, fps };
 }
@@ -657,7 +677,7 @@ async function prepareVfxAsset(sourcePath, width, height, fps) {
     args.push("-stream_loop","-1","-i",sourcePath);
   }
   args.push("-vf",vf,"-t",String(safeDuration),"-an","-c:v","libvpx-vp9","-pix_fmt","yuva420p","-crf","32","-b:v","0",
-           "-deadline","realtime","-cpu-used","5","-threads","2","-row-mt","0",out);
+           "-deadline","realtime","-cpu-used","5","-threads:v","2","-row-mt","0",out);
   await spawnFfmpeg(args, `prepare VFX ${path.basename(sourcePath)}`);
   return out;
 }
@@ -674,7 +694,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
 
       const hasAudio = audioPath && fs.existsSync(audioPath);
       const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-      console.log(`[${RENDERER_NAME}][seg${idx + 1}] START job=${jobId} ${width}x${height}@${fps} dur=${duration}s mem=${memMB}MB`);
+      console.log(`[${RENDERER_NAME}][seg${idx + 1}] START job=${jobId} ${width}x${height}@${fps} dur=${duration}s mem=${memMB}MB threads=2 filter_threads=1`);
 
       const cmd = ffmpeg()
         .setFfmpegPath(FFMPEG_PATH)
@@ -760,9 +780,13 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
         "-g", String(Math.max(2, fps * 2)),
         "-crf", String(Math.max(18, Math.min(26, parseInt(renderOptions.crf,10) || 21))),
         "-preset", renderOptions.preset || "veryfast",
-        "-threads", String(Math.max(1, Math.min(2, Number(process.env.FFMPEG_THREADS || 2)))),
+        // Explicit per-stream thread limits. Do not rely on FFmpeg's
+        // automatic CPU detection on Railway.
+        "-threads:v", "2",
+        "-threads:a", "1",
         "-filter_threads", "1",
         "-filter_complex_threads", "1",
+        "-x264-params", "threads=2:lookahead_threads=1",
         "-c:a", "aac",
         "-b:a", renderOptions.audioBitrate || "160k",
         "-t", String(duration),
@@ -800,7 +824,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
 
 async function createSegmentSafe(opts) {
   let lastErr = null;
-  const attempts = 2;
+  const attempts = 1;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       await createSegment(opts);
@@ -841,7 +865,7 @@ function spawnFfmpeg(args, description = "") {
 
 // ================================
 // CONCAT — Lossless stream-copy (no re-render, no quality loss, instant)
-// Segments already encoded at 15fps/CRF-21; just join them.
+// Segments already encoded at the requested FPS/CRF; just join them.
 // ================================
 
 async function concatSegments(segPaths, durations, outPath, renderOptions = {}) {
@@ -1137,7 +1161,15 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
       const panel = panelFolders[i];
       const outAudio = path.join(panel.dir, "audio.mp3");
 
-      fs.writeFileSync(outAudio, audio.entry.getData());
+      // Extract directly to disk instead of keeping the whole MP3 buffer
+      // alive in Node memory.
+      if (typeof zip.extractEntryTo === "function") {
+        zip.extractEntryTo(audio.entry, panel.dir, false, true);
+        const extracted = path.join(panel.dir, path.basename(audio.file));
+        if (extracted !== outAudio) fs.renameSync(extracted, outAudio);
+      } else {
+        fs.writeFileSync(outAudio, audio.entry.getData());
+      }
 
       panel.meta.audio = "audio.mp3";
       panel.meta.audio_source = "zip";
@@ -1195,7 +1227,7 @@ const cinematicAssetUpload = multer({
       cb(null, `${name}${ext}`);
     }
   }),
-  limits: { fileSize: 200 * 1024 * 1024, files: 1 }
+  limits: { fileSize: 100 * 1024 * 1024, files: 1 }
 });
 
 app.post("/library/asset", cinematicAssetUpload.single("file"), (req, res) => {
