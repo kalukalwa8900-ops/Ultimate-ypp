@@ -62,8 +62,8 @@ console.log(`✓ FFprobe Path: ${FFPROBE_PATH}`);
 app.use(cors());
 
 // FIX #2: Increase Request Limits
-app.use(express.json({ limit: "2gb" }));
-app.use(express.urlencoded({ extended: true, limit: "2gb" }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/output", express.static(path.join(__dirname, "output")));
 
@@ -907,48 +907,60 @@ app.get("/status/:jobId", (req, res) => {
 
 app.post(
   "/panel",
-  panelUpload.fields([
-    { name: "image", maxCount: 1 },
-    { name: "audio", maxCount: 1 }
-  ]),
+  // Accept the frontend's file field names without Multer rejecting a valid image/audio.
+  // The route still enforces a maximum of 4 uploaded files.
+  panelUpload.any(),
   (req, res) => {
     try {
       const projectId = safeName(req.body.project_id || req.body.projectId, "project");
       const panelId   = safeName(req.body.panel_id || req.body.panelId || `panel_${Date.now()}`, "panel");
       const duration  = Number(req.body.duration || 4);
       const narration = String(req.body.narration || "").trim();
+      const uploaded = Array.isArray(req.files) ? req.files : [];
 
-      if (!req.files?.image || !req.files.image[0]) {
-        return res.status(400).json({ success: false, error: "Image required" });
+      const isImage = (f) => /^image\//i.test(f.mimetype || "") ||
+        /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.originalname || "");
+      const isAudio = (f) => /^audio\//i.test(f.mimetype || "") ||
+        /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(f.originalname || "");
+
+      // Prefer conventional field names, then fall back to MIME/extension.
+      const imageFile =
+        uploaded.find(f => /^(image|images|imageFile|panelImage)$/i.test(f.fieldname) && isImage(f)) ||
+        uploaded.find(isImage);
+
+      const audioFile =
+        uploaded.find(f => /^(audio|audioFile|narration|mp3)$/i.test(f.fieldname) && isAudio(f)) ||
+        uploaded.find(isAudio);
+
+      if (!imageFile) {
+        cleanupFiles(uploaded.map(f => f.path));
+        return res.status(400).json({
+          success: false,
+          error: "Image required. Accepted image upload field names are flexible."
+        });
       }
 
       const projectDir = path.join(UPLOADS_ROOT, projectId);
       const panelDir   = path.join(projectDir, panelId);
-
       [projectDir, panelDir].forEach((dir) => {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       });
 
-      // FIX #1: Read from disk instead of buffer
-      const imageBuffer = fs.readFileSync(req.files.image[0].path);
-      const imagePath = path.join(panelDir, `image.jpg`);
-      fs.writeFileSync(imagePath, imageBuffer);
-      fs.unlinkSync(req.files.image[0].path); // Clean up temp file
+      // Keep the existing renderer contract: image.jpg.
+      // The upload is already on disk; copy it and remove the temporary upload.
+      const imagePath = path.join(panelDir, "image.jpg");
+      fs.copyFileSync(imageFile.path, imagePath);
 
-      let audioPath = null;
       let audioFileName = null;
-      if (req.files?.audio && req.files.audio[0]) {
-        const audioExt = extFor(req.files.audio[0], ".mp3");
-        audioFileName = `audio${audioExt}`;
-        audioPath = path.join(panelDir, audioFileName);
-        const audioBuffer = fs.readFileSync(req.files.audio[0].path);
-        fs.writeFileSync(audioPath, audioBuffer);
-        fs.unlinkSync(req.files.audio[0].path); // Clean up temp file
+      if (audioFile) {
+        audioFileName = `audio${extFor(audioFile, ".mp3")}`;
+        fs.copyFileSync(audioFile.path, path.join(panelDir, audioFileName));
       }
 
-      const index = Number(req.body.index || 0);
+      // Clean every temporary upload, including any unexpected extra files.
+      cleanupFiles(uploaded.map(f => f.path));
 
-      // Per-panel manual zoom/crop (frontend sends 0-100 % focus or 0-1)
+      const index = Number(req.body.index || 0);
       const zoomVal = Math.max(1, Math.min(3, Number(req.body.zoom || req.body.zoomFactor || 1)));
       const rawFX = Number(req.body.focusX != null ? req.body.focusX : req.body.cropX);
       const rawFY = Number(req.body.focusY != null ? req.body.focusY : req.body.cropY);
@@ -958,28 +970,22 @@ app.post(
       fs.writeFileSync(
         path.join(panelDir, "metadata.json"),
         JSON.stringify({
-          index,
-          duration,
-          narration,
-          image:       "image.jpg",
-          audio:       audioFileName,
-          zoom:        zoomVal,
-          focusX,
-          focusY,
+          index, duration, narration,
+          image: "image.jpg",
+          audio: audioFileName,
+          zoom: zoomVal, focusX, focusY,
           uploaded_at: new Date().toISOString()
         }, null, 2)
       );
 
       console.log(`[panel] saved ${projectId}/${panelId}`);
-
       return res.json({
-        success:    true,
-        panel:      panelId,
-        panel_id:   panelId,
-        ref:        panelId,
+        success: true,
+        panel: panelId,
+        panel_id: panelId,
+        ref: panelId,
         project_id: projectId
       });
-
     } catch (err) {
       console.error("/panel error:", err);
       return res.status(500).json({ success: false, error: err.message });
@@ -991,15 +997,20 @@ app.post(
 // AUDIO ZIP UPLOAD ROUTE
 // ================================
 
-app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
+app.post("/audio-zip", zipUpload.any(), async (req, res) => {
   try {
+    const uploaded = Array.isArray(req.files) ? req.files : [];
+    const zipFile = uploaded.find(f =>
+      /zip/i.test(f.mimetype || "") || /\.zip$/i.test(f.originalname || "")
+    );
+    const fileForRoute = zipFile || uploaded[0];
     const projectId = safeName(req.body.project_id || req.body.projectId, "");
     if (!projectId) {
       return res.status(400).json({ success: false, error: "Missing project_id" });
     }
 
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: "audioZip file required" });
+    if (!fileForRoute) {
+      return res.status(400).json({ success: false, error: "Audio ZIP file required" });
     }
 
     const projectDir = path.join(UPLOADS_ROOT, projectId);
@@ -1008,9 +1019,9 @@ app.post("/audio-zip", zipUpload.single("audioZip"), async (req, res) => {
     }
 
     // FIX #1: Read from disk instead of memory buffer
-    const zipBuffer = fs.readFileSync(req.file.path);
+    const zipBuffer = fs.readFileSync(fileForRoute.path);
     const zip = new AdmZip(zipBuffer);
-    fs.unlinkSync(req.file.path); // Clean up temp file
+    cleanupFiles(uploaded.map(f => f.path)); // Clean up all temporary uploads
     
     const entries = zip.getEntries();
 
@@ -1233,21 +1244,35 @@ function handleRender(req, res) {
     return;
   }
 
-  // Images only — watermark/overlay removed for stability
-  diskUpload.fields([
-    { name: "images", maxCount: 2000 }
-  ])(req, res, (multerErr) => {
+  // Images-only multipart request. If the outer /render middleware already
+  // parsed the files, normalize them to the shape expected by renderFromMultipart.
+  const continueWithImages = () => {
+    const jobId = createJob();
+    res.json({ success: true, jobId, status: "queued" });
+    enqueueRender(async () => {
+      await renderFromMultipart(req, jobId);
+    });
+  };
+
+  if (Array.isArray(req._multipartImages) && req._multipartImages.length) {
+    req.files = { images: req._multipartImages };
+    return continueWithImages();
+  }
+
+  // Fallback for non-multipart callers that enter this path with a multipart
+  // body handled by an older client.
+  diskUpload.any()(req, res, (multerErr) => {
     if (multerErr) {
       console.error("[/render] Multer error:", multerErr.message);
       return res.status(400).json({ success: false, error: multerErr.message });
     }
-
-    const jobId = createJob();
-    res.json({ success: true, jobId, status: "queued" });
-
-    enqueueRender(async () => {
-      await renderFromMultipart(req, jobId);
-    });
+    const files = Array.isArray(req.files) ? req.files : [];
+    req.files = {
+      images: files.filter(f =>
+        /^image\//i.test(f.mimetype || "") || /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.originalname || "")
+      )
+    };
+    continueWithImages();
   });
 }
 
@@ -1257,15 +1282,29 @@ function handleRender(req, res) {
 app.post("/render", (req, res) => {
   const ct = String(req.headers["content-type"] || "");
   if (ct.includes("multipart/form-data")) {
-    overlayUpload.fields([
-      { name: "overlay",     maxCount: 1 },
-      { name: "overlayLogo", maxCount: 1 },
-      { name: "watermark",   maxCount: 1 }
-    ])(req, res, (err) => {
+    // Accept arbitrary multipart field names so frontend additions (cinematic,
+    // VFX/SFX metadata, etc.) do not trigger Multer "Unexpected field".
+    // Only file count/size limits are enforced here.
+    const tolerantUpload = multer({
+      storage: overlayUpload.storage,
+      limits: { fileSize: 20 * 1024 * 1024, files: 20 }
+    }).any();
+
+    tolerantUpload(req, res, (err) => {
       if (err) {
-        console.error("[/render] overlay multer error:", err.message);
+        console.error("[/render] multipart error:", err.message);
         return res.status(400).json({ success: false, error: err.message });
       }
+
+      // Keep the object shape expected by handleRender for overlay lookup.
+      const files = Array.isArray(req.files) ? req.files : [];
+      const overlay = files.find(f => /^(overlay|overlayLogo|watermark)$/i.test(f.fieldname));
+      const images = files.filter(f =>
+        /^image\//i.test(f.mimetype || "") || /\.(jpe?g|png|webp|gif|bmp)$/i.test(f.originalname || "")
+      );
+      req._multipartFiles = files;
+      req.files = overlay ? { overlay: [overlay] } : {};
+      req._multipartImages = images;
       handleRender(req, res);
     });
   } else {
