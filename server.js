@@ -25,6 +25,7 @@ const PROJECTS_DIR = path.join(DATA_DIR, "projects");
 const OUT_DIR = path.join(DATA_DIR, "out");
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 200;
 const RETENTION_MIN = Number(process.env.RETENTION_MIN) || 240;
+const MAX_RENDER_PANELS = Number(process.env.MAX_RENDER_PANELS) || 1000;
 
 for (const d of [DATA_DIR, PROJECTS_DIR, OUT_DIR]) fs.mkdirSync(d, { recursive: true });
 
@@ -316,6 +317,7 @@ app.post("/render", upload.any(), async (req, res) => {
       ? body.panels.map((p) => (typeof p === "string" ? p : p.ref || p.panel_id)).filter(Boolean)
       : [];
     if (!refs.length) return res.status(400).json({ error: "no panels" });
+    if (refs.length > MAX_RENDER_PANELS) return res.status(400).json({ error: `too many panels: maximum ${MAX_RENDER_PANELS}` });
 
     const files = req.files || [];
     const logo = files.find((f) => ["overlay", "overlayLogo", "watermark"].includes(f.fieldname));
@@ -332,9 +334,11 @@ app.post("/render", upload.any(), async (req, res) => {
     const opts = {
       projectId,
       refs,
-      fps: Number(body.fps || body.frameRate || body.frame_rate) || 20,
+      fps: Math.max(1, Math.min(60, Number(body.fps || body.frameRate || body.frame_rate) || 20)),
+      width: Number(body.width || body.outputWidth || body.output_width) || 1280,
+      height: Number(body.height || body.outputHeight || body.output_height) || 720,
       fit: body.outputFit || body.fit || "cover",
-      audioNormalize: String(body.audioNormalize ?? body.audio_normalize ?? "true") !== "false",
+      audioNormalize: String(body.audioNormalize ?? body.audio_normalize ?? "false") === "true",
       compression: {
         crf: body.crf,
         preset: body.preset,
@@ -350,7 +354,7 @@ app.post("/render", upload.any(), async (req, res) => {
 
     runJob(jobId, opts).catch((e) => {
       console.error("[job]", jobId, e);
-      jobs.set(jobId, { jobId, status: "error", progress: 0, error: e.message });
+      jobs.set(jobId, { jobId, status: "error", progress: 0, error: e.message, hint: "FFmpeg now reports exit code/signal and stderr; check the panel/stage in the error." });
     });
 
     res.json({ jobId, success: true });
@@ -372,9 +376,10 @@ async function runJob(jobId, opts) {
     .filter(Boolean)
     .sort((a, b) => a.index - b.index);
   if (!panels.length) throw new Error("panels not found for this project");
+  if (panels.length !== opts.refs.length) throw new Error(`missing panel metadata: requested ${opts.refs.length}, found ${panels.length}`);
 
   const transitions = [];
-  for (let i = 0; i < panels.length - 1; i++) transitions.push(transitionSpec(panels[i + 1].transition));
+  for (let i = 0; i < panels.length - 1; i++) transitions.push(transitionSpec(panels[i].transition));
 
   const clips = [];
   for (let i = 0; i < panels.length; i++) {
@@ -385,6 +390,8 @@ async function runJob(jobId, opts) {
       index: i,
       extraTail: tail,
       fit: panels[i].fit || opts.fit,
+      size: { width: opts.width, height: opts.height },
+      log: (msg) => console.log(`[ffmpeg ${jobId} panel ${i + 1}] ${msg.trim()}`),
     });
     clips.push(clip);
     set({ status: "rendering", progress: Math.round(((i + 1) / panels.length) * 75) });
@@ -397,7 +404,7 @@ async function runJob(jobId, opts) {
   if (opts.overlay && opts.overlayLogoPath && fs.existsSync(opts.overlayLogoPath)) {
     set({ progress: 88 });
     const withLogo = path.join(workDir, "logo.mp4");
-    await applyOverlayLogo(current, opts.overlayLogoPath, opts.overlay, withLogo, opts.compression);
+    await applyOverlayLogo(current, opts.overlayLogoPath, opts.overlay, withLogo, { ...opts.compression, width: opts.width, height: opts.height }, (msg) => console.log(`[ffmpeg ${jobId} logo] ${msg.trim()}`));
     current = withLogo;
   }
 
@@ -405,7 +412,7 @@ async function runJob(jobId, opts) {
     set({ progress: 93 });
     const normalized = path.join(workDir, "norm.mp4");
     try {
-      await normalizeAudio(current, normalized, opts.compression);
+      await normalizeAudio(current, normalized, { ...opts.compression, width: opts.width, height: opts.height }, (msg) => console.log(`[ffmpeg ${jobId} loudnorm] ${msg.trim()}`));
       current = normalized;
     } catch (e) {
       console.warn("[job] loudnorm failed, keeping raw audio:", e.message);
@@ -500,4 +507,3 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`render backend listening on :${PORT} (data: ${DATA_DIR})`);
 });
-
