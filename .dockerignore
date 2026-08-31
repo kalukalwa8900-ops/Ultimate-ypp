@@ -1,7 +1,0 @@
-node_modules
-.git
-uploads
-output
-temp
-vfx-library/cache
-*.log
