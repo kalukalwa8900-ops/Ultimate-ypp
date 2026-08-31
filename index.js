@@ -371,12 +371,12 @@ const zipUpload = multer({
 });
 
 // ================================
-// FPS: Fixed at 25 — smooth motion, hard-encoded output framerate
+// FPS: Fixed at 15 — cinematic anime/manhua feeling, much faster render
 // ================================
 
 function getFps(panelCount) {
-  // 25fps hard-encoded output
-  return 25;
+  // 15fps: more visible motion per frame, anime/manhua style, ~40% faster encode
+  return 15;
 }
 
 // ================================
@@ -405,32 +405,48 @@ function calculateFitInFrame(imageAspectRatio, frameWidth = 1280, frameHeight = 
 }
 
 // ================================
-// Ken Burns Animation — zoom in / zoom out ONLY (no pans/slides)
-// 25fps · scale=2560 · zoom=1.18
+// Ken Burns Animation — cinematic zoom in/out + slide left/right/up/down
+// 15fps · scale=2560 · zoom=1.18 · movement 10%–18% for alive anime feel
 // ================================
 
 function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
-  const fps = 25; // Always 25fps
+  const fps = 15; // Always 15fps
   const totalFrames = Math.ceil(duration * fps);
   const normalised = String(aspectMode || "fit").toLowerCase().trim();
 
   if (normalised === "fit") {
-    // FIT MODE — full image visible, letterbox/pillarbox, zoom in/out only
+    // FIT MODE — full image visible, letterbox/pillarbox, strong Ken Burns
     const animations = [
       // 1. Zoom IN (100% → 118%)
-      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
       // 2. Zoom OUT (118% → 100%)
-      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 3. Slide LEFT (pan 10% → 18%)
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.10,min(x+iw*0.08/${totalFrames},iw*0.18))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 4. Slide RIGHT (pan 18% → 10%)
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.18,max(x-iw*0.08/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 5. Slide UP (pan 8% → 16% vertical)
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,min(y+ih*0.08/${totalFrames},ih*0.16))':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
+      // 6. Slide DOWN (pan 16% → 8% vertical)
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.16,max(y-ih*0.08/${totalFrames},ih*0.08))':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,setsar=1`,
     ];
     return animations[idx % animations.length];
 
   } else if (normalised === "cinematic") {
-    // CINEMATIC MODE — fill full frame, zoom in/out only
+    // CINEMATIC MODE — fill full frame, stronger zoom and movement
     const animations = [
       // 1. Zoom IN center
-      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
       // 2. Zoom OUT center
-      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,setsar=1`,
+      `scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
+      // 3. Slide LEFT
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.10,min(x+iw*0.08/${totalFrames},iw*0.18))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
+      // 4. Slide RIGHT
+      `scale=2560:-1,zoompan=z='1.18':x='if(lte(on,1),iw*0.18,max(x-iw*0.08/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
+      // 5. Slide UP
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.08,min(y+ih*0.08/${totalFrames},ih*0.16))':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
+      // 6. Slide DOWN
+      `scale=2560:-1,zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='if(lte(on,1),ih*0.16,max(y-ih*0.08/${totalFrames},ih*0.08))':d=${totalFrames}:s=1280x720:fps=15,setsar=1`,
     ];
     return animations[idx % animations.length];
   }
@@ -439,12 +455,15 @@ function getKenBurnsFilter(idx, duration, panelCount = 1, aspectMode = "fit") {
     // BLUR-PAD MODE — original image centred at native ratio over a heavily
     // blurred, scaled copy of itself. No distortion, no black bars.
     // Ken Burns is applied to the foreground only; the blurred bg is static.
-    // Zoom in/out only.
     const animations = [
       // 1. Zoom IN foreground
-      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='min(zoom+0.0009,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
       // 2. Zoom OUT foreground
-      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=25,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='if(lte(on,1),1.18,max(zoom-0.0009,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      // 3. Slide LEFT
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='1.12':x='if(lte(on,1),iw*0.10,min(x+iw*0.06/${totalFrames},iw*0.16))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
+      // 4. Slide RIGHT
+      `split[bg][fg];[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,gblur=sigma=22,eq=brightness=-0.05[bg2];[fg]scale=2560:-1,zoompan=z='1.12':x='if(lte(on,1),iw*0.16,max(x-iw*0.06/${totalFrames},iw*0.10))':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1280x720:fps=15,scale=1280:720:force_original_aspect_ratio=decrease[fg2];[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1`,
     ];
     return animations[idx % animations.length];
   }
@@ -523,7 +542,7 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
     const cmd = ffmpeg()
       .setFfmpegPath(FFMPEG_PATH)
       .input(imagePath)
-      .inputOptions(["-loop 1", "-framerate 25"]);
+      .inputOptions(["-loop 1", "-framerate 15"]);
 
     if (hasAudio) {
       cmd.input(audioPath);
@@ -576,8 +595,8 @@ function createSegment({ imagePath, audioPath, text, duration, outPath, jobId, i
       ...videoFilterFlag,
       `-c:v ${videoCodec}`,
       `-pix_fmt ${pixFmt}`,
-      `-r 25`,           // ← 25 fps output (hard-encoded)
-      `-g 50`,           // ← GOP = 2× fps for clean seeking
+      `-r 15`,           // ← 15 fps output
+      `-g 30`,           // ← GOP = 2× fps for clean seeking
       `-crf ${crf}`,
       `-preset ${preset}`,
       `-threads 0`,      // ← Let FFmpeg use all available CPU cores
@@ -701,7 +720,7 @@ function spawnFfmpeg(args, description = "") {
 
 // ================================
 // CONCAT — Lossless stream-copy (no re-render, no quality loss, instant)
-// Segments already encoded at 25fps/CRF-21; just join them.
+// Segments already encoded at 15fps/CRF-21; just join them.
 // ================================
 
 async function concatWithTransitions(segPaths, durations, outPath, renderOptions = {}) {
@@ -1316,7 +1335,7 @@ async function renderFromProject(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: 25,
+      fps: 15,
       aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
@@ -1436,7 +1455,7 @@ async function renderFromMultipart(req, jobId) {
       renderer: RENDERER_NAME,
       format: "MP4 (H264 Video + AAC Audio)",
       device_support: "Universal (iOS, Android, Chrome, Safari, Edge)",
-      fps: 25,
+      fps: 15,
       aspectMode: renderOptions.aspectMode,
       encodingSettings: {
         crf: renderOptions.crf,
