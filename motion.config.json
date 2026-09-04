@@ -1,0 +1,6 @@
+{
+  "zoomShare": 60,
+  "zoomAmount": 1.12,
+  "transitionSeconds": 0.5,
+  "transitionCycle": ["cut", "dissolve", "cut", "fade_black"]
+}

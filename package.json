@@ -1,20 +1,19 @@
 {
-  "name": "scriptreel",
-  "version": "1.0.0",
-  "description": "Image + narration → MP4 video via FFmpeg",
-  "main": "index.js",
+  "name": "video-renderer-backend",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Local Node/Express + FFmpeg video renderer for the slideshow frontend",
+  "main": "src/index.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node src/index.js",
+    "check": "node -e \"require('child_process').execSync('node --check src/index.js',{stdio:'inherit'})\""
   },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "fluent-ffmpeg": "^2.1.2",
+    "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
-    "node-fetch": "^3.3.2",
-    "adm-zip": "^0.5.10"
-  },
-  "engines": {
-    "node": ">=18"
+    "unzipper": "^0.12.3"
   }
 }
