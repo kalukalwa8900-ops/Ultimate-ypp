@@ -9,7 +9,7 @@ const { ffmpeg } = require("../lib/ffmpeg");
 const router = express.Router();
 
 router.post("/stitch", async (req, res) => {
-  const publicBase = process.env.PUBLIC_BASE ? SERVER.publicBase : `${req.protocol}://${req.get("host")}`;
+  const publicBase = process.env.PUBLIC_BASE ? SERVER.publicBase : `https://${req.get("host")}`;
   const urls = Array.isArray(req.body?.urls) ? req.body.urls.map(String).filter(Boolean) : [];
   if (urls.length < 2) return res.status(400).json({ error: "At least 2 video URLs are required" });
   if (urls.some((u) => !/^https?:\/\//i.test(u))) {

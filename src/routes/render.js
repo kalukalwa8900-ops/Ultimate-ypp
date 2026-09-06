@@ -40,12 +40,10 @@ function cleanupUploadedFiles(files) {
   }
 }
 
-/** http(s)://host the request actually arrived on — correct whether this is
- *  running on localhost or behind a proxy (Railway, Render, etc.), instead
- *  of the PUBLIC_BASE env var / localhost fallback baked in at startup. */
+/** Public HTTPS host used by the deployment proxy (Railway, etc.). */
 function publicBaseFor(req) {
   if (process.env.PUBLIC_BASE) return SERVER.publicBase;
-  return `${req.protocol}://${req.get("host")}`;
+  return `https://${req.get("host")}`;
 }
 
 /** Builds panels from the project directory when the client sends none. */
