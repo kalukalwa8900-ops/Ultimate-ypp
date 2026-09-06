@@ -50,7 +50,7 @@ const SERVER = {
   port: Number(process.env.PORT || 8080),
   host: process.env.HOST || "0.0.0.0",
   // Public base used to build the local video URL. Always http for localhost.
-  publicBase: (process.env.PUBLIC_BASE || `http://localhost:${Number(process.env.PORT || 8080)}`).replace(/\/+$/, ""),
+  publicBase: (process.env.PUBLIC_BASE || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : "")).replace(/\/+$/, ""),
   maxConcurrentFfmpeg: Math.max(1, Number(process.env.MAX_CONCURRENT_FFMPEG || 1)),
   keepTemp: /^(1|true|yes)$/i.test(String(process.env.KEEP_TEMP || "")),
   transitionSeconds: Number(process.env.TRANSITION_SECONDS || 0.5),

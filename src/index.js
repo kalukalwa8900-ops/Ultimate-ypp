@@ -63,10 +63,7 @@ app.use((err, req, res, next) => {
 
 const server = app.listen(SERVER.port, SERVER.host, async () => {
   const ok = await ffmpegAvailable();
-  const displayUrl = process.env.PUBLIC_BASE
-    || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
-    || `http://${SERVER.host}:${SERVER.port} (local)`;
-  console.log(`video-renderer-backend listening on ${SERVER.host}:${SERVER.port} — public URL: ${displayUrl}`);
+  console.log(`video-renderer-backend listening on http://localhost:${SERVER.port}`);
   console.log(`output dir: ${path.relative(process.cwd(), DIRS.output)}`);
   if (!ok) console.warn("WARNING: ffmpeg/ffprobe not found in PATH — install FFmpeg or set FFMPEG_PATH/FFPROBE_PATH");
 });
