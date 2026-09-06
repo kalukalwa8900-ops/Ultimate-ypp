@@ -19,14 +19,13 @@ npm install
 npm start
 ```
 
-Windows shortcut: double-click `start.bat`.
 
-Server: `http://localhost:8080` (change with `PORT`).
+Production: Railway assigns the PORT and public HTTPS domain automatically.
 
 Health check:
 
 ```bash
-curl http://localhost:8080/health
+Health check: open `https://YOUR-RAILWAY-DOMAIN/health`.
 ```
 
 ## 3. Deploy to Railway
@@ -44,7 +43,7 @@ FFmpeg installed instead of the default Nixpacks build (which does not include F
    automatically, the server already binds to `0.0.0.0`, and `app.set("trust proxy", true)`
    plus the per-request `req.protocol` check means `/render` and `/stitch` already return
    an `https://your-app.up.railway.app/output/xxx.mp4` link once Railway's proxy is in
-   front of it — not `http://localhost:8080`.
+   front of it — not `https://YOUR-RAILWAY-DOMAIN`.
 4. Optional but recommended: after the first deploy, copy the Railway-assigned domain and
    set it as a `PUBLIC_BASE` variable in the Railway dashboard, e.g.
    `PUBLIC_BASE=https://your-app.up.railway.app`. This isn't needed for `/render` or
@@ -127,7 +126,7 @@ Stages: `queued`, `preparing`, `checking`, `preparing_vfx`, `rendering`, `finali
 When complete the response includes:
 
 ```json
-{ "videoUrl": "http://localhost:8080/output/job_abc_final.mp4" }
+{ "videoUrl": "https://YOUR-RAILWAY-DOMAIN/output/job_abc_final.mp4" }
 ```
 
 ## 5. Settings

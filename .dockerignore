@@ -11,4 +11,3 @@ output
 cache
 
 # Windows-only local helper, irrelevant inside the container
-start.bat

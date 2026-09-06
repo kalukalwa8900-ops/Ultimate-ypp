@@ -2,14 +2,16 @@
   "name": "video-renderer-backend",
   "version": "3.0.0",
   "private": true,
-  "description": "Local Node/Express + FFmpeg video renderer for the slideshow frontend",
+  "description": "Railway Node/Express + FFmpeg video renderer backend",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
     "check": "node -e \"require('child_process').execSync('node --check src/index.js',{stdio:'inherit'})\""
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
