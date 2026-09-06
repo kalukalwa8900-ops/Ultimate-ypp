@@ -23,7 +23,6 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 200 * 1024 * 1024, files: 5000 },
   fileFilter(req, file, cb) {
     const ok = IMAGE_RE.test(file.originalname) || AUDIO_RE.test(file.originalname);
     cb(ok ? null : new Error(`Unsupported file type: ${file.originalname}`), ok);
@@ -46,11 +45,14 @@ router.post("/panel", upload.any(), (req, res) => {
 
   res.json({
     ok: true,
+    success: true,
     projectId,
+    project_id: projectId,
     uploaded: (req.files || []).length,
     imageCount: images.length,
     audioCount: audio.length,
     panels,
+    panel_id: panels[panels.length - 1]?.panel ?? null,
   });
 });
 

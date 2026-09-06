@@ -15,7 +15,6 @@ const upload = multer({
     destination: (req, file, cb) => cb(null, ensureDir(DIRS.uploadTmp)),
     filename: (req, file, cb) => cb(null, `${newId("zip_")}.zip`),
   }),
-  limits: { fileSize: 4 * 1024 * 1024 * 1024 },
 });
 
 /** Streams the ZIP from disk and writes only MP3-ish entries into the project. */
@@ -71,7 +70,9 @@ router.post("/audio-zip", upload.single("audioZip"), async (req, res) => {
 
     res.json({
       ok: true,
+      success: true,
       projectId,
+      project_id: projectId,
       audioCount: files.length,
       files: naturalSort(files.map((f) => f.file)),
       attached: files,
