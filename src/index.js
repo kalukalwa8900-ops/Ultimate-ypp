@@ -13,25 +13,11 @@ const app = express();
 // the video URLs we generate below (see publicBaseFor()).
 app.set("trust proxy", true);
 
-// A page loaded from a public https:// origin (e.g. a Lovable/Cloudflare
-// preview URL) that tries to reach this backend on http://localhost is
-// subject to Chrome's Private Network Access / Local Network Access checks
-// (enforced since Chrome 142, Oct 2025). Chrome preflights those requests
-// and requires this exact response header on the OPTIONS reply, or it
-// silently blocks every request — which looks like "images won't upload"
-// with no other error. This header is necessary but not always sufficient:
-// Chrome may still show a one-time "Allow local network access?" permission
-// prompt the user has to accept (see chrome://settings/content/localNetworkAccess).
-// The most reliable fix is architectural, not this header — see README.
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Private-Network", "true");
-  next();
-});
 app.use(cors());
 app.use(express.json({ limit: "2gb" }));
 app.use(express.urlencoded({ extended: true, limit: "2gb" }));
 
-// Final videos are served over plain HTTP from the local machine.
+// Final videos are served from the Railway service over its public HTTPS domain.
 app.use("/output", express.static(DIRS.output, { maxAge: 0 }));
 
 app.get("/health", async (req, res) => {
@@ -63,7 +49,7 @@ app.use((err, req, res, next) => {
 
 const server = app.listen(SERVER.port, SERVER.host, async () => {
   const ok = await ffmpegAvailable();
-  console.log(`video-renderer-backend listening on http://localhost:${SERVER.port}`);
+  console.log(`video-renderer-backend listening on ${process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `port ${SERVER.port}`}`);
   console.log(`output dir: ${path.relative(process.cwd(), DIRS.output)}`);
   if (!ok) console.warn("WARNING: ffmpeg/ffprobe not found in PATH — install FFmpeg or set FFMPEG_PATH/FFPROBE_PATH");
 });

@@ -49,7 +49,7 @@ const ENCODE = {
 const SERVER = {
   port: Number(process.env.PORT || 8080),
   host: process.env.HOST || "0.0.0.0",
-  // Public base used to build the local video URL. Always http for localhost.
+  // Public HTTPS base for generated video URLs. Railway supplies RAILWAY_PUBLIC_DOMAIN.
   publicBase: (process.env.PUBLIC_BASE || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : "")).replace(/\/+$/, ""),
   maxConcurrentFfmpeg: Math.max(1, Number(process.env.MAX_CONCURRENT_FFMPEG || 1)),
   keepTemp: /^(1|true|yes)$/i.test(String(process.env.KEEP_TEMP || "")),
