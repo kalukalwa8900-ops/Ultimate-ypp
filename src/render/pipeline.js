@@ -62,9 +62,7 @@ function short(list) {
 }
 
 /** Runs the whole render for a job. Never throws — failures land in the job store.
- *  publicBase (host the /render request actually arrived on) is optional —
- *  falls back to SERVER.publicBase (PUBLIC_BASE env var, or localhost) for
- *  any caller that doesn't pass it. */
+ *  publicBase is the public HTTPS base supplied by the Railway request path. */
 async function runJob(job, plan, settings, publicBase) {
   const base = (publicBase || SERVER.publicBase).replace(/\/+$/, "");
   const paths = ensureProject(job.projectId);
