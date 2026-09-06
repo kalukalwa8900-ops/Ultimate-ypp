@@ -61,8 +61,12 @@ function short(list) {
   return list.length > 12 ? `${list.slice(0, 12).join(", ")} … (+${list.length - 12} more)` : list.join(", ");
 }
 
-/** Runs the whole render for a job. Never throws — failures land in the job store. */
-async function runJob(job, plan, settings) {
+/** Runs the whole render for a job. Never throws — failures land in the job store.
+ *  publicBase (host the /render request actually arrived on) is optional —
+ *  falls back to SERVER.publicBase (PUBLIC_BASE env var, or localhost) for
+ *  any caller that doesn't pass it. */
+async function runJob(job, plan, settings, publicBase) {
+  const base = (publicBase || SERVER.publicBase).replace(/\/+$/, "");
   const paths = ensureProject(job.projectId);
   const segDir = ensureDir(safeJoin(paths.tmp, job.jobId));
   const outFile = safeJoin(DIRS.output, `${job.jobId}_final.mp4`);
@@ -98,7 +102,9 @@ async function runJob(job, plan, settings) {
         imagePath: item.imagePath,
         audioPath: item.audioPath,
         duration: item.duration,
-        motion: pickMotion(i),
+        // Keep panels with VFX completely static so the effect is composited
+        // onto a stable image instead of a moving zoom/pan frame.
+        motion: item.vfxName ? "static" : pickMotion(i),
         inKind, outKind,
         vfx: item.vfxName ? vfxMap.get(item.vfxName) : null,
         sfx: item.sfxName ? sfxMap.get(item.sfxName) : null,
@@ -131,7 +137,7 @@ async function runJob(job, plan, settings) {
       stage: "complete", status: "complete", progress: 100,
       currentPanel: plan.length, totalPanels: plan.length,
       message: "Video ready",
-      videoUrl: `${SERVER.publicBase}/output/${path.basename(outFile)}`,
+      videoUrl: `${base}/output/${path.basename(outFile)}`,
       finishedAt: Date.now(),
     });
   } catch (err) {

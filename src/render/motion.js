@@ -15,11 +15,18 @@ function pickMotion(index0) {
 
 /**
  * Builds the image filter chain for one panel:
- * scale (cover) -> zoompan motion -> optional look filter -> fps/format.
+ * scale (cover) -> optional zoompan motion -> fps/format.
  * Every value comes from the resolved settings — nothing hardcoded.
  */
-function imageChain({ motion, width, height, fps, duration, filterExpr }) {
+function imageChain({ motion, width, height, fps, duration }) {
   const frames = Math.max(1, Math.round(duration * fps));
+  if (motion === "static") {
+    return [
+      `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+      `crop=${width}:${height}`,
+      `setsar=1`,
+    ].join(",");
+  }
   const SW = width * 2, SH = height * 2; // oversample so zoompan stays sharp
   const zMax = CONFIG.zoomAmount ?? 1.12;
   const step = `(${zMax}-1)/${frames}`;
@@ -57,8 +64,7 @@ function imageChain({ motion, width, height, fps, duration, filterExpr }) {
     `trim=duration=${duration.toFixed(3)}`,
     `setpts=PTS-STARTPTS`,
   ];
-  if (filterExpr) parts.push(filterExpr);
-  parts.push("setsar=1", "format=yuv420p");
+  parts.push("setsar=1");
   return parts.join(",");
 }
 

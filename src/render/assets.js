@@ -1,9 +1,8 @@
 "use strict";
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 const { DIRS } = require("../config");
-const { listFiles, sanitizeName, safeJoin, VIDEO_RE, AUDIO_RE, ensureDir } = require("../lib/fsx");
+const { listFiles, sanitizeName, safeJoin, VIDEO_RE, AUDIO_RE } = require("../lib/fsx");
 const { videoInfo, ffmpeg } = require("../lib/ffmpeg");
 
 /** Library name = filename without extension. */
@@ -29,21 +28,14 @@ function findAsset(kind, name) {
   return null;
 }
 
-function fingerprint(file, width, height, fps) {
-  const st = fs.statSync(file);
-  const h = crypto.createHash("sha1")
-    .update(`${path.basename(file)}|${st.size}|${Math.round(st.mtimeMs)}|${width}x${height}@${fps}`)
-    .digest("hex").slice(0, 16);
-  return h;
-}
-
 /**
- * Prepares each UNIQUE vfx asset once per (source fingerprint + resolution + fps)
- * and caches the result. Compatible sources are reused as-is.
+ * Uses each VFX source directly. The source is NOT pre-resized, re-encoded,
+ * or converted to yuv420p. The render filtergraph performs scaling/FPS
+ * adaptation immediately before compositing, which avoids unnecessary
+ * color/subsampling changes to the original VFX.
  */
 async function prepareVfxAssets(names, settings, onEach) {
-  ensureDir(DIRS.vfxCache);
-  const out = new Map(); // name -> { path, hasAlpha }
+  const out = new Map(); // name -> { path, hasAlpha, duration }
   const unique = [...new Set(names.filter(Boolean))];
   let done = 0;
   for (const name of unique) {
@@ -51,28 +43,7 @@ async function prepareVfxAssets(names, settings, onEach) {
     if (!src) { done++; onEach && onEach(done, unique.length, name); continue; }
 
     const info = await videoInfo(src);
-    const compatible =
-      info.width === settings.width &&
-      info.height === settings.height &&
-      Math.abs(info.fps - settings.fps) < 0.51 &&
-      /h264|vp9|prores|qtrle|png/i.test(info.codec);
-
-    if (compatible) {
-      out.set(name, { path: src, hasAlpha: info.hasAlpha, duration: info.duration });
-    } else {
-      const cacheFile = safeJoin(DIRS.vfxCache, `${sanitizeName(name)}_${fingerprint(src, settings.width, settings.height, settings.fps)}.mp4`);
-      if (!fs.existsSync(cacheFile)) {
-        await ffmpeg([
-          "-y", "-i", src,
-          "-an",
-          "-vf", `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=increase,crop=${settings.width}:${settings.height},fps=${settings.fps},format=yuv420p`,
-          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-          cacheFile,
-        ], { label: `prepare vfx ${name}` });
-      }
-      const cinfo = await videoInfo(cacheFile);
-      out.set(name, { path: cacheFile, hasAlpha: false, duration: cinfo.duration });
-    }
+    out.set(name, { path: src, hasAlpha: info.hasAlpha, duration: info.duration });
     done++;
     onEach && onEach(done, unique.length, name);
   }

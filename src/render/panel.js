@@ -6,7 +6,7 @@ const { fadeChain, audioFadeChain } = require("./transitions");
 
 /**
  * Renders ONE panel segment: image + automatic motion + optional VFX +
- * narration + optional SFX + optional light filter, baked fades included.
+ * narration + optional SFX, baked fades included.
  * One ffmpeg process, one output file.
  */
 async function renderPanel({
@@ -25,24 +25,39 @@ async function renderPanel({
   if (sfx && sfx.path) { args.push("-stream_loop", "-1", "-i", sfx.path); sfxIdx = next++; }
 
   const chains = [];
-  chains.push(`[0:v]${imageChain({ motion, width, height, fps, duration: dur, filterExpr: settings.filterExpr })}[base]`);
+  // IMPORTANT: keep the source VFX untouched. We do all compositing in RGB
+  // space so FFmpeg does not blend YUV chroma planes (which can introduce
+  // unwanted magenta/pink colour casts on bright PNG artwork).
+  chains.push(`[0:v]${imageChain({ motion, width, height, fps, duration: dur })},format=gbrp[base]`);
 
   let vLabel = "base";
   if (vfxIdx >= 0) {
     const op = Math.min(1, Math.max(0, settings.vfxOpacity));
-    chains.push(`[${vfxIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=${fps},setsar=1[fx]`);
+    const mode = settings.vfxBlendMode || "screen";
+
+    // Scale/FPS the original decoded VFX only at composite time. Do NOT
+    // pre-render it to an intermediate yuv420p/H.264 file.
+    chains.push(`[${vfxIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=${fps},setsar=1,format=gbrp[fxsrc]`);
+
     if (vfx.hasAlpha) {
-      // Real alpha channel: straight overlay with opacity.
-      chains.push(`[fx]format=yuva420p,colorchannelmixer=aa=${op}[fxa]`);
-      chains.push(`[base][fxa]overlay=shortest=1:format=auto[vfxed]`);
+      // Preserve alpha-capable sources. Blend RGB, then use the original
+      // alpha as the effect mask. This prevents transparent RGB from
+      // tinting the underlying image.
+      chains.push(`[fxsrc]split=2[fxrgb][fxalpha]`);
+      chains.push(`[fxalpha]alphaextract,format=gray,lut=a='val*${op}'[fxmask]`);
+      chains.push(`[base][fxrgb]blend=all_mode=${mode}:all_opacity=1:shortest=1[fxblend]`);
+      chains.push(`[base][fxblend][fxmask]maskedmerge[vfxed]`);
     } else {
-      // Black-background effect: screen blend keeps the black transparent-ish.
-      chains.push(`[base][fx]blend=all_mode=screen:all_opacity=${op}:shortest=1[vfxed]`);
+      // For the normal black-background VFX workflow, Screen is intentionally
+      // performed in RGB space. Opacity controls only effect strength.
+      chains.push(`[base][fxsrc]blend=all_mode=${mode}:all_opacity=${op}:shortest=1[vfxed]`);
     }
     vLabel = "vfxed";
   }
 
   const fades = fadeChain({ inKind, outKind, duration: dur });
+  // yuv420p is applied only to the FINAL rendered video for MP4 compatibility;
+  // it is deliberately not applied to the source VFX before compositing.
   const vTail = ["setsar=1", "format=yuv420p"];
   chains.push(`[${vLabel}]${fades ? fades + "," : ""}${vTail.join(",")}[vout]`);
 
