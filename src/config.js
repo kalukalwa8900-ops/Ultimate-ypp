@@ -31,18 +31,13 @@ const DEFAULTS = {
   fps: 25,
   vfx_enabled: true,
   vfx_opacity: 0.8,
+  vfx_blend_mode: "screen",
   sfx_enabled: true,
   sfx_volume: 0.1,
-  filter: "none",
 };
 
-const FILTERS = {
-  none: null,
-  warm: "eq=saturation=1.08:gamma_r=1.04:gamma_b=0.97",
-  cool: "eq=saturation=1.05:gamma_b=1.05:gamma_r=0.97",
-  cinematic: "eq=contrast=1.08:saturation=1.06:gamma=0.98",
-  bw: "hue=s=0",
-};
+const BLEND_MODES = { screen: "screen", lighten: "lighten", overlay: "overlay", addition: "addition", normal: "normal", difference: "difference" };
+
 
 const ENCODE = {
   crf: Number(process.env.CRF || 21),
@@ -83,7 +78,9 @@ function resolveSettings(raw) {
     return Math.min(1, Math.max(0, n));
   };
 
-  const filterKey = Object.prototype.hasOwnProperty.call(FILTERS, s.filter) ? s.filter : "none";
+  const blendKey = Object.prototype.hasOwnProperty.call(BLEND_MODES, s.vfx_blend_mode)
+    ? s.vfx_blend_mode
+    : (Object.prototype.hasOwnProperty.call(BLEND_MODES, s.vfxBlendMode) ? s.vfxBlendMode : DEFAULTS.vfx_blend_mode);
 
   return {
     resolution: resKey,
@@ -92,13 +89,12 @@ function resolveSettings(raw) {
     fps,
     vfxEnabled: pick(pick(s.vfx_enabled, s.vfxEnabled), DEFAULTS.vfx_enabled) !== false,
     vfxOpacity: clamp01(pick(s.vfx_opacity, s.vfxOpacity), DEFAULTS.vfx_opacity),
+    vfxBlendMode: blendKey,
     sfxEnabled: pick(pick(s.sfx_enabled, s.sfxEnabled), DEFAULTS.sfx_enabled) !== false,
     sfxVolume: clamp01(pick(s.sfx_volume, s.sfxVolume), DEFAULTS.sfx_volume),
-    filter: filterKey,
-    filterExpr: FILTERS[filterKey],
     motion: "automatic",
     transitions: "automatic",
   };
 }
 
-module.exports = { DIRS, RESOLUTIONS, ALLOWED_FPS, DEFAULTS, FILTERS, ENCODE, SERVER, BIN, resolveSettings };
+module.exports = { DIRS, RESOLUTIONS, ALLOWED_FPS, DEFAULTS, BLEND_MODES, ENCODE, SERVER, BIN, resolveSettings };
