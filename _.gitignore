@@ -1,0 +1,6 @@
+node_modules/
+uploads/
+output/
+temp/
+npm-debug.log
+.env
